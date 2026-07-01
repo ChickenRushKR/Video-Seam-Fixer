@@ -1,133 +1,129 @@
+<!-- Language: **🇰🇷 한국어** · [🇺🇸 English](README.en.md) -->
+
 # seam-fixer
 
-**Make the cut between consecutively-generated video clips invisible.**
+**생성 모델로 이어 만든 영상 클립들의 경계(이음새)를 지웁니다.**
 
-When you extend a video with a generative model — clip **B** conditioned on the last frame of
-clip **A**, then **C** on B, then **D** on C — concatenating them leaves a visible seam at every
-cut. `seam-fixer` removes that seam with a fast, deterministic, post-hoc pass (no model, no
-per-clip retraining) and ships both a CLI and a local web app.
+생성 모델로 영상을 연장할 때 — 클립 **A**의 마지막 프레임을 조건으로 **B**를, B로 **C**를, C로
+**D**를 생성 — 이어 붙이면 컷마다 이음새가 눈에 띕니다. `seam-fixer`는 빠르고 결정론적인
+후처리 한 번으로(모델 없음, 재학습 없음) 그 이음새를 제거하며, CLI와 로컬 웹앱을 함께 제공합니다.
 
 ```
 A ──┐        ┌── B ──┐        ┌── C ──┐        ┌── D
-    │  seam  │       │  seam  │       │  seam  │
+    │  이음새 │       │  이음새 │       │  이음새 │
     ▼        ▼       ▼        ▼       ▼        ▼
- [ scale/colour/exposure/sharpness/lighting drift + a duplicate freeze frame ]
+ [ 비율/색/노출/샤프니스/라이팅 드리프트 + 중복 freeze 프레임 ]
                           │  seam-fixer
                           ▼
-A ───────────────────────────────────────────────── D   (one continuous take)
+A ───────────────────────────────────────────────── D   (하나의 연속된 촬영본처럼)
 ```
 
 ---
 
-## The problem (what actually causes the seam)
+## 문제 — 이음새는 왜 생기나
 
-Each generated clip is *almost* a continuation of the previous one, but not exactly. Measuring
-the boundary between real generated clips shows the discontinuity is **not random** — it's a
-small, consistent, per-clip drift that **accumulates down the chain**:
+생성된 각 클립은 이전 클립의 *거의* 연장이지만 정확하진 않습니다. 실제 생성 클립들의 경계를
+측정하면 이 불연속은 **무작위가 아니라**, 작고 일관된 **클립별 드리프트**이며 **체인을 따라
+누적**됩니다:
 
-| what drifts | example (measured, clip A→D) | how you perceive it |
+| 드리프트 | 측정 예시 (A→D 누적) | 체감 |
 |---|---|---|
-| **scale / ratio** (anisotropic!) | x **+4.9%**, y **+1.4%** | frame "pops" bigger at the cut |
-| **colour / exposure** | each clip ~0.5–0.9% brighter | a flicker in tone |
-| **sharpness** | each clip a bit sharper | texture "shimmers" |
-| **lighting field** | spatially-varying (e.g. tunnel) | a lighting "wipe" |
-| **duplicate frame** | B[0] ≈ A[-1] (the conditioning frame) | a 1-frame **freeze / stutter** |
+| **비율 / 스케일** (비등방!) | x **+4.9%**, y **+1.4%** | 컷에서 화면이 확 커짐 |
+| **색 / 노출** | 클립마다 ~0.5–0.9% 밝아짐 | 톤이 깜빡임 |
+| **샤프니스** | 클립마다 조금씩 선명 | 질감이 일렁임 |
+| **라이팅 필드** | 공간적으로 다름 (예: 터널) | 조명이 "쓸리는" 느낌 |
+| **중복 프레임** | B[0] ≈ A[-1] (조건 프레임) | 1프레임 **freeze / 멈칫** |
 
-Two findings drove the design:
+설계를 결정지은 두 가지 발견:
 
-1. **The scale drift is anisotropic** — horizontal and vertical scale differently, so a uniform
-   (similarity) transform can't fix it; a **full affine** is required.
-2. **The seam step is *smaller* than normal motion**, not larger — because B[0] duplicates A[-1].
-   So the cut reads as a *hitch*, and dropping that duplicate frame restores continuous motion.
+1. **스케일 드리프트가 비등방**입니다 — 가로/세로가 다르게 커져서, 균일(similarity) 변환으론
+   못 맞춥니다. **full affine**이 필요합니다.
+2. **이음새의 움직임이 정상 모션보다 오히려 *작습니다*** — B[0]가 A[-1]의 중복이기 때문입니다.
+   그래서 컷이 *멈칫*으로 읽히고, 그 중복 프레임을 버리면 움직임이 다시 연속됩니다.
 
-(An earlier per-clip "cascade" that corrected each clip independently made things *worse*: it
-shifted a clip's whole body, breaking the *next* seam it fed into. See
-[Design history](#design-history).)
-
----
-
-## How it works (method + rationale)
-
-`seam-fixer` treats the whole sequence as one chain and maps **every clip into the first clip's
-reference space**, so both sides of every cut end up in the same space → the seam matches and no
-downstream seam is broken. Per clip, composed cumulatively to the reference:
-
-1. **Geometry — full affine, background-locked.**
-   Estimate a 6-DOF affine (independent x/y scale + shear + rotation + translation) from
-   `next[0]` to `prev[-1]` with ORB + RANSAC. Crucially, features are matched on the **static
-   background only** (a cheap motion mask removes the moving subject) — otherwise the subject's
-   motion biases the global fit. Anisotropic scale is the reason a full affine (not a similarity
-   transform) is used. Composed across seams; a centre crop-zoom removes any border.
-
-2. **Colour + exposure.** Per-channel `gain·x + bias` (matching both mean and std → colour
-   balance *and* exposure/contrast).
-
-3. **Sharpness.** Match high-frequency energy (blur / unsharp) so one clip isn't crisper than
-   its neighbour.
-
-4. **Lighting.** A **spatially-varying low-frequency gain map** (small 24×14 grid = very smooth,
-   can't form a blob), **subject-masked** so the person is never relit and gently clamped. This
-   is what fixes location-dependent lighting (e.g. a bright-centre tunnel) that a global gain
-   can't. Self-adaptive: ≈1 where lighting already matches, corrective where it differs.
-
-5. **Drop the duplicate frame.** Each next clip's first frame ≈ the previous clip's last frame,
-   so it's skipped — turning the seam freeze into a normal motion step.
-
-**Why chain-consistent instead of "fix each seam locally"?** A local fix that moves a whole clip
-toward its predecessor changes that clip's *tail*, which was the anchor the *next* clip was
-generated from — so it just pushes the error downstream. Mapping everything to one reference
-makes every seam consistent at once. Verified: correcting all four clips this way keeps
-`downstream_integrity ≈ 0` (a clip's tail is not disturbed relative to what feeds off it).
-
-**Two dead ends worth not repeating** (measured, not guessed):
-- *ECC intensity refinement* of the affine **diverged** — global photometric alignment gets
-  pulled off by the moving subject + lighting. Background-masked ORB is the clean path.
-- *Cross-dissolving* the cut **ghosts** the moving subject (double exposure). The seam residual
-  is genuine subject motion; blending is the wrong tool.
-
-### What's left after all this
-Each seam's residual bottoms out at the **subject-motion floor** — `prev[-1]` and `next[0]` are
-different *moments*, so a subject in motion can't be aligned away. Going below that needs **frame
-interpolation** (synthesizing in-between poses) or **regeneration**, not post-hoc correction.
-`seam-fixer` deliberately stops there rather than introducing artifacts.
-
-### Modes
-- **`tight`** (default) — match each cut as closely as possible. Correction is chained to the
-  first clip, so later clips carry more of it.
-- **`balanced`** — map every clip to the *average* look instead; each clip changes less (stays
-  natural) at the cost of slightly looser seam matching.
+(클립을 각각 독립적으로 보정하던 초기 "캐스케이드"는 오히려 **악화**시켰습니다 — 한 클립 전체를
+움직여서 그 클립이 물려 있던 *다음* 이음새를 깨뜨렸습니다. [개발 히스토리](#개발-히스토리) 참고.)
 
 ---
 
-## Install
+## 동작 원리 (방법 + 논리)
+
+`seam-fixer`는 전체 시퀀스를 하나의 체인으로 보고 **모든 클립을 첫 클립의 기준 공간으로 매핑**합니다.
+그러면 모든 컷의 양쪽이 같은 공간에 놓여 이음새가 맞춰지고, 다음(downstream) 이음새도 깨지지
+않습니다. 클립마다, 기준 공간으로 누적 합성:
+
+1. **기하 — full affine, 배경 잠금.**
+   ORB + RANSAC으로 `next[0] → prev[-1]`의 6-DOF affine(가로/세로 독립 스케일 + shear + 회전 +
+   이동)을 추정합니다. 핵심은 특징점을 **정지 배경에서만** 매칭한다는 것 — 값싼 모션 마스크로
+   움직이는 피사체를 제외합니다. 안 그러면 피사체 움직임이 전역 변환을 왜곡합니다. 비등방
+   스케일 때문에 similarity가 아닌 full affine을 씁니다. 컷마다 누적하고, 중앙 crop-zoom으로
+   테두리를 제거합니다.
+
+2. **색 + 노출.** 채널별 `gain·x + bias` (평균과 표준편차를 함께 매칭 → 색 밸런스 + 노출/대비).
+
+3. **샤프니스.** 고주파 에너지를 맞춰(블러/언샤프) 한 클립만 더 선명한 것을 방지합니다.
+
+4. **라이팅.** **공간가변 저주파 게인 맵**(작은 24×14 그리드 = 아주 부드러움, 블롭 불가),
+   **피사체 마스킹**(사람은 절대 리라이팅 안 함) + 완만한 clamp. 전역 게인으론 못 잡는
+   위치별 조명(예: 중앙이 밝은 터널)을 해결합니다. 자기적응형: 이미 맞는 곳은 ≈1, 다른 곳만 보정.
+
+5. **중복 프레임 제거.** 각 다음 클립의 첫 프레임 ≈ 이전 클립의 마지막 프레임이므로 건너뜁니다 —
+   이음새의 freeze를 정상 모션 스텝으로 바꿉니다.
+
+**왜 국소 보정이 아니라 체인 일관 보정인가?** 한 클립을 이전 클립 쪽으로 당기는 국소 보정은 그
+클립의 *꼬리*를 바꾸는데, 그 꼬리가 바로 *다음* 클립이 생성될 때의 앵커였습니다 — 결국 오차를
+downstream으로 밀 뿐입니다. 전부 하나의 기준으로 매핑하면 모든 이음새가 한 번에 일관됩니다.
+검증: 네 클립을 이렇게 보정하면 `downstream_integrity ≈ 0` (클립 꼬리가 다음에 물리는 것 대비
+흐트러지지 않음).
+
+**반복하지 말아야 할 막다른 길 2개** (추측 아닌 측정):
+- affine의 *ECC(밝기 기반) 정밀화*는 **발산**했습니다 — 전역 광도 정렬이 움직이는 피사체 +
+  라이팅에 끌려갑니다. 배경 마스킹 ORB가 깨끗한 길입니다.
+- 컷을 *크로스디졸브*하면 움직이는 피사체가 **잔상(이중 노출)**을 냅니다. 이음새 잔차는 진짜
+  피사체 움직임이라, 블렌드는 잘못된 도구입니다.
+
+### 그래도 남는 것
+각 이음새 잔차는 **피사체 움직임 바닥값**에서 멈춥니다 — `prev[-1]`과 `next[0]`은 서로 다른
+*순간*이라, 움직이는 피사체는 정렬로 지울 수 없습니다. 그 아래로 가려면 **프레임 보간**(중간 포즈
+합성)이나 **재생성**이 필요하며, 후보정 영역이 아닙니다. `seam-fixer`는 아티팩트를 만드느니
+여기서 멈춥니다.
+
+### 모드
+- **`tight`** (기본) — 각 컷을 최대한 맞춤. 보정이 첫 클립 기준으로 누적돼 후반 클립이 더 많이
+  보정됩니다.
+- **`balanced`** — 모든 클립을 *평균* 룩으로 매핑. 각 클립이 덜 바뀌어(자연스러움) 이음새 매칭은
+  약간 느슨해집니다.
+
+---
+
+## 설치
 
 ```bash
-# Torch (RTX 50-series / Blackwell needs the cu128 build; adjust for your GPU/CPU)
+# Torch (RTX 50 시리즈/Blackwell은 cu128 빌드 필요; GPU/CPU에 맞게 조정)
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
 pip install opencv-python-headless imageio[ffmpeg] numpy flask
-# ffmpeg must be on PATH (used for concat + the slow-motion comparison)
+# ffmpeg가 PATH에 있어야 함 (concat + 슬로우모션 비교에 사용)
 ```
 
 ---
 
-## Usage
+## 사용법
 
-### Web app (recommended)
+### 웹앱 (권장)
 ```bash
 python webapp/server.py        # -> http://127.0.0.1:5000
 ```
-Open the URL, **add clips in order** (drag to reorder), pick a mode, press **Run**. A live
-progress bar shows each stage (analyze → render → compare) with elapsed time; when done, the
-**boundary slow-motion** (raw vs fixed, side by side) and the **full result** play inline with
-download links. Access it via the URL — opening the HTML file directly (`file://`) will fail on
-the API calls.
+URL을 열고 **클립을 순서대로 추가**(드래그로 재정렬), 모드 선택 후 **Run**. 단계별 진행바
+(analyze → render → compare)와 경과 시간이 실시간 표시되고, 완료되면 **경계 슬로우모션**(좌 raw ·
+우 fixed)과 **전체 결과**가 인라인 재생 + 다운로드됩니다. 반드시 URL로 접속하세요 — HTML 파일을
+직접(`file://`) 열면 API 호출이 실패합니다.
 
 ### CLI
 ```bash
-# explicit clip list, in order
+# 클립 경로를 순서대로
 python scripts/chain_normalize.py A.mp4 B.mp4 C.mp4 D.mp4 --out out/ --mode tight
 
-# built-in sample chains
+# 내장 샘플 체인
 python scripts/chain_normalize.py 3            # samples/video3-{A,B,C,D}.mp4
 ```
 
@@ -138,47 +134,43 @@ from vbf.normalize import normalize_chain
 result = normalize_chain(
     ["A.mp4", "B.mp4", "C.mp4", "D.mp4"],
     out_dir="out/",
-    mode="tight",            # or "balanced"
+    mode="tight",            # 또는 "balanced"
     drop_dup=True,
     progress=lambda stage, frac, msg: print(f"{frac:.0%} {stage} {msg}"),
 )
 print(result.full_path, result.slow_path, result.seams, result.seconds)
 ```
 
-**Outputs** (in the chosen `out_dir`):
-| file | contents |
+**출력물** (지정한 `out_dir`):
+| 파일 | 내용 |
 |---|---|
-| `result_full.mp4` | the whole chain, seam-normalized |
-| `result_boundaries_slow.mp4` | each cut, 4× slow, **RAW ∣ FIXED** side by side |
+| `result_full.mp4` | 전체 체인, 경계 정규화본 |
+| `result_boundaries_slow.mp4` | 각 컷 4배 슬로우, **RAW ∣ FIXED** 좌우 비교 |
 
-Notes: clips are resized to the first clip's resolution; fps is taken from the first clip;
-processing streams **one clip at a time** (bounded memory). A 4×~290-frame 1080×1920 chain
-takes ~80 s on an RTX 5090.
+참고: 클립은 첫 클립 해상도로 리사이즈, fps는 첫 클립 기준. **클립 하나씩 스트리밍** 처리(메모리
+한정). 4×~290프레임 1080×1920 체인 기준 RTX 5090에서 ~80초.
 
 ---
 
-## Repository layout
+## 저장소 구성
 ```
-vbf/normalize/chain.py     # v1 core: normalize_chain() + the estimators
-scripts/chain_normalize.py # CLI wrapper
-webapp/                    # Flask server + static UI (slots, progress polling, players)
-vbf/metrics/perceptual.py  # no-dep SSIM / Lab ΔE / motion-baseline / temporal (evaluation)
-scripts/eval_boundaries.py # per-boundary metric panel (seam L1, SSIM, ΔE, downstream, ...)
-samples/                   # example generated chains (video2-*, video3-*)
+vbf/normalize/chain.py     # v1 코어: normalize_chain() + 추정기들
+scripts/chain_normalize.py # CLI 래퍼
+webapp/                    # Flask 서버 + 정적 UI (슬롯, 진행 폴링, 플레이어)
+vbf/metrics/perceptual.py  # 무의존 SSIM / Lab ΔE / motion-baseline / temporal (평가)
+scripts/eval_boundaries.py # 경계별 지표 패널 (seam L1, SSIM, ΔE, downstream, ...)
+samples/                   # 예시 생성 체인 (video2-*, video3-*)
 ```
 
-## Design history
-The seam turned out **not** to be a colour problem (the first hypothesis) nor subject motion
-(the second) — a metric-vs-perception gap corrected by measuring against each clip's own motion
-baseline and by full-affine analysis. The working method (chain normalization) replaced an
-earlier per-seam "least-destructive cascade" that looked good on a single-frame L1 metric but
-broke downstream seams and introduced a colour cast. The evaluation harness
-(`scripts/eval_boundaries.py`) exists to keep that honest: it separates *did the seam get closer*
-(seam L1) from *is it still perceptually intact* (SSIM, ΔE) and *did we disturb the rest*
-(correction magnitude, downstream integrity).
+## 개발 히스토리
+이음새는 색 문제(첫 가설)도, 피사체 움직임(둘째 가설)도 **아니었습니다** — 각 클립 자신의 모션
+baseline과 비교하고 full-affine으로 분석하면서 바로잡은 "지표 vs 지각" 간극이었습니다. 최종
+방법(체인 정규화)은, 단일 프레임 L1 지표로는 좋아 보였지만 downstream 이음새를 깨고 색이 튀던
+기존 "least-destructive 캐스케이드"를 대체했습니다. 평가 하베스트
+(`scripts/eval_boundaries.py`)가 이를 정직하게 유지합니다: *이음새가 가까워졌나*(seam L1)와
+*지각적으로 멀쩡한가*(SSIM, ΔE), *나머지를 망쳤나*(보정량, downstream integrity)를 분리 측정합니다.
 
-## Limitations
-- Assumes a single continuous scene per chain (shared background); hard cuts between different
-  scenes are out of scope.
-- Corrects **global** per-clip drift; a within-clip drift is only approximated.
-- The subject-motion residual at each cut is left intact by design.
+## 한계
+- 체인당 하나의 연속 장면(공유 배경)을 가정합니다. 서로 다른 장면 간 하드컷은 범위 밖입니다.
+- **전역** 클립별 드리프트를 보정합니다. 클립 내부 드리프트는 근사만 됩니다.
+- 각 컷의 피사체 움직임 잔차는 의도적으로 그대로 둡니다.
