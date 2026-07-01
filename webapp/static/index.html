@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Video Boundary Fixer — v1</title>
+<link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+<div class="app">
+  <header>
+    <h1>Video Boundary Fixer <span class="tag">v1</span></h1>
+    <p class="sub">생성 클립들을 순서대로 넣고 <b>Run</b> — 경계(색·비율·노출·샤프니스·라이팅)를 정렬해 이음새를 지웁니다.</p>
+  </header>
+
+  <section class="panel">
+    <div class="panel-head">
+      <h2>1 · 클립 추가 <span class="hint">(순서대로, 최소 2개)</span></h2>
+      <div class="row gap">
+        <button id="addBtn" class="btn">+ 영상 추가</button>
+        <button id="clearBtn" class="btn ghost">비우기</button>
+      </div>
+      <input id="fileInput" type="file" accept="video/*" multiple hidden />
+    </div>
+    <ul id="slots" class="slots"></ul>
+    <p id="emptyHint" class="empty">여기로 영상을 끌어다 놓거나 “영상 추가”를 누르세요.</p>
+  </section>
+
+  <section class="panel">
+    <h2>2 · 옵션</h2>
+    <div class="opts">
+      <label class="opt">
+        <span>보정 모드</span>
+        <select id="mode">
+          <option value="tight">tight — 경계 최대한 매칭 (권장)</option>
+          <option value="balanced">balanced — 클립 자연스러움 우선</option>
+        </select>
+      </label>
+      <label class="opt check">
+        <input type="checkbox" id="dropDup" checked />
+        <span>중복 프레임 제거 <span class="hint">(경계 freeze 방지)</span></span>
+      </label>
+    </div>
+    <button id="runBtn" class="btn primary" disabled>▶ Run</button>
+  </section>
+
+  <section id="progressPanel" class="panel hidden">
+    <h2>3 · 처리 중</h2>
+    <div class="prog-row">
+      <div class="bar"><div id="barFill" class="fill"></div></div>
+      <div id="pct" class="pct">0%</div>
+    </div>
+    <div class="prog-meta">
+      <span id="stage" class="chip">queued</span>
+      <span id="msg" class="msg">대기 중…</span>
+      <span id="timer" class="timer">0.0s</span>
+    </div>
+    <ol id="steps" class="steps">
+      <li data-k="analyze">클립 분석 · 경계 오프셋 추정</li>
+      <li data-k="render">전체 렌더링 (정렬 적용)</li>
+      <li data-k="compare">경계 슬로우 비교 생성</li>
+      <li data-k="done">완료</li>
+    </ol>
+  </section>
+
+  <section id="resultPanel" class="panel hidden">
+    <h2>4 · 결과</h2>
+    <div id="stats" class="stats"></div>
+    <div class="videos">
+      <figure>
+        <figcaption>경계 슬로우 (좌 RAW · 우 FIXED)</figcaption>
+        <video id="slowVid" controls loop playsinline></video>
+        <a id="slowDl" class="btn ghost sm" download>내려받기</a>
+      </figure>
+      <figure>
+        <figcaption>전체 결과</figcaption>
+        <video id="fullVid" controls playsinline></video>
+        <a id="fullDl" class="btn ghost sm" download>내려받기</a>
+      </figure>
+    </div>
+  </section>
+
+  <div id="err" class="err hidden"></div>
+</div>
+<script src="/static/app.js"></script>
+</body>
+</html>

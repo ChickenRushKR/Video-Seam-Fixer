@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vbf"
+version = "0.1.0"
+description = "Video Boundary Fixer — optimize the boundary/continuity between two generated videos"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch",
+    "torchvision",
+    "imageio[ffmpeg]>=2.31",
+    "numpy",
+    "pydantic>=2.0",
+    "pyyaml",
+    "tensorboard",
+]
+
+[project.scripts]
+vbf = "vbf.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["vbf*"]

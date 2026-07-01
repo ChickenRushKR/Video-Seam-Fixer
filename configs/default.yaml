@@ -1,0 +1,59 @@
+# Video Boundary Fixer — default configuration.
+
+io:
+  fps: null                 # null => infer from video-A; videos must share fps
+  working_scale: 0.5        # optimize at half native res, ASPECT RATIO PRESERVED.
+                            # native 1080x1920 is heavy for RAFT + B optimization.
+  working_resolution: null  # explicit [H, W] override; can distort aspect, prefer working_scale
+  output_resolution: null   # null => restore to native source resolution on save
+
+window:
+  anchor_frames: 8          # K: last K frames of A held fixed (anchor)
+  optimize_b_frames: null   # M: optimize only first M frames of B; null => all of B
+
+refiner:
+  backend: warpcolor        # gradient | warp | warpcolor (warp + color/exposure)
+  num_steps: 200
+  log_every: 20
+  lr: 0.02
+  optimizer: adam
+  constant: true            # apply drift correction uniformly to all of B (constant generation
+                            # drift), not decaying. Needs window.optimize_b_frames: null (all B).
+  warp:
+    model: affine           # affine | translation (global, rigid => no background wobble)
+    strength: 0.0           # 0 => geometric warp OFF (color-only). Flow-based drift estimation
+                            # is unreliable on high-motion clips; left off pending a robust method.
+    max_disp: 0.1           # per-iteration clamp on the excess field
+    fit_size: 32            # downsample excess to this grid for a robust global fit
+    reg_iters: 4            # iterative registration steps (captures scale/rotation, not just shift)
+  color:
+    strength: 1.0           # fraction of the A<-B color/exposure difference to correct
+    match_std: true         # match contrast (per-channel std) as well as mean
+    gain_clamp: 2.0         # clamp gain to [1/clamp, clamp]
+
+loss:
+  # NOTE: the metric losses live on small, different scales (warp-err ~1e-3,
+  # log-ratio ~1e-2, flicker ~1e-4), so weights are chosen to balance their
+  # gradient contributions, not to be equal.
+  weights:
+    flicker: 1.0
+    ratio: 5.0
+    flow: 10.0
+    fidelity: 2.0           # keep optimized B close to original B
+  metrics:
+    flicker:
+      color_space: rgb      # rgb | lab
+    ratio:
+      stats: [mean, std]    # per-channel statistics whose frame-to-frame ratio is smoothed
+    flow:
+      model: raft_large     # torchvision RAFT (used as a no-grad flow estimator)
+      warp_consistency: true
+      radius: 3             # pairs within +/- radius of the seam
+      num_flow_updates: 6   # RAFT refinement iters (lower = cheaper)
+      flow_resolution: null # [H, W] for RAFT estimation; null => working resolution
+
+logging:
+  tensorboard: true
+  jsonl: true
+  save_snapshots: true
+  experiments_dir: experiments
