@@ -155,6 +155,8 @@ class ChainResult:
     seams: list[dict] = field(default_factory=list)   # per-seam metrics
     seconds: float = 0.0
     transforms: dict = field(default_factory=dict)     # cumulative scale/colour/lighting per clip
+    interpolate: int = 0                               # midpoints inserted per seam (0 = off)
+    interp_backend: str = ""                           # backend actually used
 
 
 # --------------------------------------------------------------------------- #
@@ -166,10 +168,18 @@ def normalize_chain(
     mode: str = "tight",
     drop_dup: bool = True,
     make_slow: bool = True,
+    interpolate: int = 0,
+    interp_backend: str = "rife",
     progress=None,
 ) -> ChainResult:
     """Normalize a chain of clips so the cuts are invisible; write the full result and a
     side-by-side (raw|fixed) boundary slow-motion.
+
+    ``interpolate`` (v2): insert this many synthesized in-between frames at each seam to
+    smooth the residual motion step (0 = off). With ``drop_dup=True`` and ``interpolate=1``
+    the length is unchanged vs the originals (the dropped duplicate is replaced by a true
+    motion midpoint). ``interp_backend``: ``rife`` (learned, handles occlusion; falls back to
+    ``flow`` if ccvfi is unavailable) or ``flow`` (RAFT warp, no extra deps).
 
     ``progress(stage: str, frac: float, message: str)`` is called throughout (frac 0..1).
     """
@@ -241,10 +251,21 @@ def normalize_chain(
         nf = apply_frame(first_f[i], Ms[i], cum_g[i], cum_b[i], cum_s[i], Ww, Hh)
         cum_L.append((cum_L[-1] * lighting_gain(pf, nf)).clamp(0.80, 1.25))
 
-    # ---- PHASE 2: render (stream one clip at a time), drop duplicate seam frames ----
+    # ---- PHASE 2: render (stream one clip at a time), drop duplicate seam frames,
+    #      optionally insert interpolated in-between frames at each seam (v2) ----
     full_path = os.path.join(out_dir, "result_full.mp4")
+    itp = None
+    if interpolate > 0:
+        from vbf.interp import get_interpolator
+        itp = get_interpolator(interp_backend, device=("cuda" if torch.cuda.is_available() else "cpu"))
+        prog("render", 0.30, f"Interpolation on ({getattr(itp, 'backend', interp_backend)}, K={interpolate})")
+
+    def _apply(fr_u8, k, i):
+        f = to_float(fr_u8[k:k + 1])[0]
+        return apply_frame(f, Ms[i], cum_g[i], cum_b[i], cum_s[i], Ww, Hh, cum_L[i])
 
     def gen():
+        prev_corr_last = None
         for i, p in enumerate(clip_paths):
             prog("render", 0.30 + 0.55 * i / N, f"Rendering clip {i + 1}/{N}")
             v = load_video(p)
@@ -252,18 +273,26 @@ def normalize_chain(
             if (fr.shape[2], fr.shape[3]) != ref_hw:
                 fr = to_uint8(F.interpolate(to_float(fr), size=ref_hw, mode="bilinear", align_corners=False))
             start = 1 if (drop_dup and i > 0) else 0
-            for k in range(start, fr.shape[0]):
-                f = to_float(fr[k:k + 1])[0]
-                yield to_uint8(apply_frame(f, Ms[i], cum_g[i], cum_b[i], cum_s[i], Ww, Hh, cum_L[i]))
+            first_corr = _apply(fr, start, i)
+            if itp is not None and i > 0 and prev_corr_last is not None:   # synth midpoints at the seam
+                for j in range(1, interpolate + 1):
+                    t = j / (interpolate + 1)
+                    yield to_uint8(itp.interpolate(prev_corr_last, first_corr, t))
+            yield to_uint8(first_corr)
+            for k in range(start + 1, fr.shape[0]):
+                corr = _apply(fr, k, i)
+                yield to_uint8(corr)
+            prev_corr_last = corr if fr.shape[0] > start + 1 else first_corr
             del v, fr
 
     n = save_video_stream(full_path, gen(), fps=fps)
 
-    # ---- seam positions (raw vs de-duped) + per-seam metric ----
+    # ---- seam positions (raw vs de-duped, incl. inserted frames) + per-seam metric ----
     raw_seam, fix_seam, emitted = [], [], 0
     for i in range(N):
         if i > 0:
-            fix_seam.append(emitted)
+            emitted += interpolate           # midpoints inserted before this clip's frames
+            fix_seam.append(emitted)         # window centres on the interpolated seam region
         emitted += lengths[i] - (1 if (drop_dup and i > 0) else 0)
     acc = 0
     for i in range(N):
@@ -288,6 +317,8 @@ def normalize_chain(
     return ChainResult(
         full_path=full_path, slow_path=slow_path, num_frames=n, fps=fps, mode=mode,
         seams=seams, seconds=round(time.time() - t0, 1),
+        interpolate=interpolate,
+        interp_backend=(getattr(itp, "backend", interp_backend) if itp is not None else ""),
         transforms={
             "scale_xy_pct": [[round((x - 1) * 100, 2), round((y - 1) * 100, 2)] for x, y in sxy],
             "colour_gain": [round(float(np.mean(g)), 3) for g in cum_g],

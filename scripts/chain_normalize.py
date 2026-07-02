@@ -17,6 +17,8 @@ def main():
     ap.add_argument("--mode", default="tight", choices=["tight", "balanced"])
     ap.add_argument("--no-drop-dup", action="store_true", help="keep the duplicate seam frame")
     ap.add_argument("--no-slow", action="store_true", help="skip the boundary slow-mo comparison")
+    ap.add_argument("--interpolate", type=int, default=0, help="v2: insert K synthesized frames per seam (0=off; 1 keeps length)")
+    ap.add_argument("--interp-backend", default="rife", choices=["rife", "flow"], help="interpolation backend (rife falls back to flow)")
     args = ap.parse_args()
 
     clips = args.clips
@@ -31,8 +33,11 @@ def main():
         print(f"[{frac*100:5.1f}%] {stage:8} {msg}")
 
     r = normalize_chain(clips, out, mode=args.mode, drop_dup=not args.no_drop_dup,
-                        make_slow=not args.no_slow, progress=prog)
+                        make_slow=not args.no_slow, interpolate=args.interpolate,
+                        interp_backend=args.interp_backend, progress=prog)
     print(f"\n{r.num_frames}f @ {r.fps}fps in {r.seconds}s -> {r.full_path}")
+    if r.interpolate:
+        print(f"interpolation: {r.interpolate} frame(s)/seam via {r.interp_backend}")
     if r.slow_path:
         print(f"boundary slow-mo -> {r.slow_path}")
     print("scale x/y %:", r.transforms["scale_xy_pct"])

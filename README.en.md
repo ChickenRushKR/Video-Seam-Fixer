@@ -21,6 +21,44 @@ A ──────────────────────────
 
 ---
 
+## Representative use case (why this tool exists)
+
+**Setup.** You want a long video from an image→video model but can't generate it all at once, so
+you **extend clip by clip** — e.g. a person dancing by a river (portrait 1080×1920). Generate
+clip A, then generate B **conditioned on A's last frame**, then C from B's end, then D from C's.
+Concatenate the four into one piece.
+
+**What you see.** On playback each cut **pops slightly bigger (zoom)**, the **brightness/colour
+flickers**, and the motion **hitches** for a frame. Each is subtle but clearly visible at the
+cut, and it **accumulates** — by D the image is noticeably more zoomed and brighter than A. It
+"looks stitched."
+
+![Seam example](docs/seam_example.png)
+
+> `A_last` and `B_first` look almost identical, but overlaying them at 50% (3rd) reveals a
+> **ghost/double** — that *is* the seam (scale/position/colour mismatch). After alignment the
+> overlay (4th) is crisp on background & edges; the remaining hand double is *genuine subject
+> motion*, which is what [Stage 2 interpolation](#stage-2--seam-motion-interpolation-learned) handles.
+
+**What had to be fixed (and the wrong turns).**
+- First guessed it was *colour* → matching colour alone added a red cast and made it worse
+  (measured: the colour difference was small).
+- Then suspected *subject motion* (the diff map lit up the person) → but that was the pattern of
+  a slight **global zoom** (every edge moves), not the subject.
+- Measured properly: the real cause was **anisotropic scale (x≠y) + accumulating
+  colour/exposure/sharpness/lighting drift + a duplicate freeze frame** — several overlapping
+  issues, not one.
+- And fixing one clip toward its predecessor changed that clip's *tail*, **breaking the next
+  cut** (error propagation).
+
+**So how it was built.** Align *all* clips into one shared reference (no propagation), then fill
+the *residual subject motion* alignment can't remove with a **learned interpolator**. The
+[two halves](#how-it-works-method--rationale) (deterministic alignment + learned interpolation)
+are the conclusion of that process. Every decision was **verified with metrics**, not the eye
+(colour ΔE, structural SSIM, each clip's own motion baseline, downstream integrity).
+
+---
+
 ## The problem (what actually causes the seam)
 
 Each generated clip is *almost* a continuation of the previous one, but not exactly. Measuring
@@ -50,8 +88,20 @@ shifted a clip's whole body, breaking the *next* seam it fed into. See
 
 ## How it works (method + rationale)
 
-`seam-fixer` treats the whole sequence as one chain and maps **every clip into the first clip's
-reference space**, so both sides of every cut end up in the same space → the seam matches and no
+The design has **two complementary halves**:
+
+- **Stage 1 · Alignment (deterministic):** undo the *global* per-clip drift (scale, colour,
+  exposure, sharpness, lighting) exactly, with no model.
+- **Stage 2 · Interpolation (learned):** smooth the *residual subject motion* that alignment
+  can't remove, by synthesizing in-between frames (RIFE).
+
+Deterministic alignment is precise and stable for the global drift; a learned model is strong
+where alignment can't reach (the temporal motion). Each tool is placed where it wins.
+
+### Stage 1 — chain alignment (deterministic)
+
+Treat the whole sequence as one chain and map **every clip into the first clip's reference
+space**, so both sides of every cut end up in the same space → the seam matches and no
 downstream seam is broken. Per clip, composed cumulatively to the reference:
 
 1. **Geometry — full affine, background-locked.**
@@ -87,17 +137,29 @@ makes every seam consistent at once. Verified: correcting all four clips this wa
 - *Cross-dissolving* the cut **ghosts** the moving subject (double exposure). The seam residual
   is genuine subject motion; blending is the wrong tool.
 
-### What's left after all this
-Each seam's residual bottoms out at the **subject-motion floor** — `prev[-1]` and `next[0]` are
-different *moments*, so a subject in motion can't be aligned away. Going below that needs **frame
-interpolation** (synthesizing in-between poses) or **regeneration**, not post-hoc correction.
-`seam-fixer` deliberately stops there rather than introducing artifacts.
+**Modes:** **`tight`** (default) — match each cut as closely as possible; correction is chained
+to the first clip, so later clips carry more of it. **`balanced`** — map every clip to the
+*average* look instead; each clip changes less (stays natural) at the cost of slightly looser
+seam matching.
 
-### Modes
-- **`tight`** (default) — match each cut as closely as possible. Correction is chained to the
-  first clip, so later clips carry more of it.
-- **`balanced`** — map every clip to the *average* look instead; each clip changes less (stays
-  natural) at the cost of slightly looser seam matching.
+### Stage 2 — seam motion interpolation (learned)
+
+After alignment, each seam's residual is the **subject-motion floor** — `prev[-1]` and `next[0]`
+are different *moments*, so a subject in motion can't be aligned away. So we **synthesize K
+in-between frames and insert them** at each seam (K=1 + duplicate-drop = length-preserving: the
+dropped freeze is replaced by a real midpoint).
+
+- **`flow`** (no deps): bidirectional RAFT flow warps pixels toward the midpoint + an
+  occlusion-aware blend. Fine for small motion, but **fast/occluded parts (e.g. a swinging hand)
+  tear or go translucent** — the fundamental limit of "moving pixels" (raising flow resolution
+  doesn't help).
+- **`rife`** (recommended): a learned network (RIFE v4.26, weights auto-downloaded via `ccvfi`)
+  estimates intermediate flow + *hallucinates* occluded content + learns the fusion, so it
+  **reconstructs the hand the flow backend tears** into a solid mid-pose. Arbitrary timestep, so
+  K=2/3 work too. Falls back to `flow` if `ccvfi` is absent.
+
+Because Stage 1 already aligned the two seam frames, the interpolator's input is clean and its
+output is better. It runs only on the few seam frames, so it adds ~1 s to the whole job.
 
 ---
 
@@ -108,6 +170,7 @@ interpolation** (synthesizing in-between poses) or **regeneration**, not post-ho
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
 pip install opencv-python-headless imageio[ffmpeg] numpy flask
 # ffmpeg must be on PATH (used for concat + the slow-motion comparison)
+pip install ccvfi   # (optional) v2 RIFE interpolation backend; falls back to flow if absent
 ```
 
 ---
@@ -131,7 +194,13 @@ python scripts/chain_normalize.py A.mp4 B.mp4 C.mp4 D.mp4 --out out/ --mode tigh
 
 # built-in sample chains
 python scripts/chain_normalize.py 3            # samples/video3-{A,B,C,D}.mp4
+
+# v2: seam motion interpolation (replaces the freeze with a real midpoint; K=1 keeps length)
+python scripts/chain_normalize.py 3 --interpolate 1 --interp-backend rife
 ```
+
+`--interpolate K` enables [Stage 2](#stage-2--seam-motion-interpolation-learned)
+(`--interp-backend rife|flow`).
 
 ### Python API
 ```python
@@ -142,6 +211,8 @@ result = normalize_chain(
     out_dir="out/",
     mode="tight",            # or "balanced"
     drop_dup=True,
+    interpolate=1,           # Stage 2: K midpoints per seam (0 = off)
+    interp_backend="rife",   # "rife" (recommended) or "flow"
     progress=lambda stage, frac, msg: print(f"{frac:.0%} {stage} {msg}"),
 )
 print(result.full_path, result.slow_path, result.seams, result.seconds)
@@ -161,11 +232,13 @@ takes ~80 s on an RTX 5090.
 
 ## Repository layout
 ```
-vbf/normalize/chain.py     # v1 core: normalize_chain() + the estimators
+vbf/normalize/chain.py     # core: normalize_chain() = alignment (Stage 1) + interpolation (Stage 2)
+vbf/interp/                # Stage 2 backends: flow (RAFT, no deps) + rife (ccvfi)
 scripts/chain_normalize.py # CLI wrapper
 webapp/                    # Flask server + static UI (slots, progress polling, players)
 vbf/metrics/perceptual.py  # no-dep SSIM / Lab ΔE / motion-baseline / temporal (evaluation)
 scripts/eval_boundaries.py # per-boundary metric panel (seam L1, SSIM, ΔE, downstream, ...)
+scripts/interp_experiment.py # interpolation validation (self-test PSNR + ghost proxy + hold-vs-interp)
 samples/                   # example generated chains (video2-*, video3-*)
 ```
 
@@ -183,4 +256,5 @@ broke downstream seams and introduced a colour cast. The evaluation harness
 - Assumes a single continuous scene per chain (shared background); hard cuts between different
   scenes are out of scope.
 - Corrects **global** per-clip drift; a within-clip drift is only approximated.
-- The subject-motion residual at each cut is left intact by design.
+- Residual subject motion is smoothed by Stage 2, but very large or heavily occluded motion
+  isn't perfect (use the `rife` backend there; `flow` ghosts).

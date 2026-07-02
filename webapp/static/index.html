@@ -40,6 +40,17 @@
         <input type="checkbox" id="dropDup" checked />
         <span>중복 프레임 제거 <span class="hint">(경계 freeze 방지)</span></span>
       </label>
+      <label class="opt check">
+        <input type="checkbox" id="interpOn" />
+        <span>경계 모션 보간 <span class="hint">(v2 · freeze를 중간 프레임으로 대체)</span></span>
+      </label>
+      <label class="opt" id="interpOpts" style="display:none">
+        <span>보간 프레임 수 / 백엔드</span>
+        <span class="row gap">
+          <select id="interpK"><option value="1">K=1 (길이 보존)</option><option value="2">K=2</option><option value="3">K=3</option></select>
+          <select id="interpBackend"><option value="rife">RIFE (권장, 가림 강함)</option><option value="flow">flow (무의존)</option></select>
+        </span>
+      </label>
     </div>
     <button id="runBtn" class="btn primary" disabled>▶ Run</button>
   </section>
@@ -57,7 +68,7 @@
     </div>
     <ol id="steps" class="steps">
       <li data-k="analyze">클립 분석 · 경계 오프셋 추정</li>
-      <li data-k="render">전체 렌더링 (정렬 적용)</li>
+      <li data-k="render">전체 렌더링 (정렬 + 보간)</li>
       <li data-k="compare">경계 슬로우 비교 생성</li>
       <li data-k="done">완료</li>
     </ol>

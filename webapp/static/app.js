@@ -68,6 +68,7 @@ function render() {
 }
 
 // ---------- inputs ----------
+$("#interpOn").onchange = (e) => { $("#interpOpts").style.display = e.target.checked ? "flex" : "none"; };
 $("#addBtn").onclick = () => $("#fileInput").click();
 $("#fileInput").onchange = (e) => { addFiles(e.target.files); e.target.value = ""; };
 $("#clearBtn").onclick = () => { slots.forEach((s) => URL.revokeObjectURL(s.url)); slots = []; render(); };
@@ -92,6 +93,8 @@ $("#runBtn").onclick = async () => {
   slots.forEach((s) => fd.append("clips", s.file, s.file.name));
   fd.append("mode", $("#mode").value);
   fd.append("drop_dup", $("#dropDup").checked ? "true" : "false");
+  fd.append("interpolate", $("#interpOn").checked ? $("#interpK").value : "0");
+  fd.append("interp_backend", $("#interpBackend").value);
 
   let job;
   try {
@@ -135,6 +138,7 @@ function showResult(job, res) {
     <div class="stat"><b>${res.num_frames}</b><span>frames @ ${res.fps}fps</span></div>
     <div class="stat"><b>${res.seconds}s</b><span>처리 시간</span></div>
     <div class="stat"><b>${res.mode}</b><span>모드</span></div>
+    ${res.interpolate ? `<div class="stat"><b>K=${res.interpolate}</b><span>보간 (${res.interp_backend})</span></div>` : ""}
     <table class="seams"><thead><tr><th>경계</th><th>raw 갭</th><th>누적 스케일 x/y</th></tr></thead><tbody>${seamRows}</tbody></table>`;
   const bust = "?t=" + Date.now();
   if (res.has_slow) { $("#slowVid").src = `/api/video/${job}/slow${bust}`; $("#slowDl").href = `/api/video/${job}/slow`; }
