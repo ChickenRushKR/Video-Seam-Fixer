@@ -81,9 +81,13 @@ def to_float_resized(
 
 
 def save_video_stream(
-    path: str | Path, frames_iter: Iterable[torch.Tensor], fps: float
+    path: str | Path, frames_iter: Iterable[torch.Tensor], fps: float, crf: int = 16
 ) -> int:
-    """Write an iterable of uint8 frames ``[3,H,W]`` to an mp4. Returns frame count."""
+    """Write an iterable of uint8 frames ``[3,H,W]`` to an mp4. Returns frame count.
+
+    Encodes with an explicit x264 ``crf`` (default 16 = visually near-lossless); without it
+    imageio falls back to a mid-quality default that visibly softens the output.
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     n = 0
@@ -94,6 +98,7 @@ def save_video_stream(
         format="FFMPEG",
         pixelformat="yuv420p",
         macro_block_size=1,  # don't silently resize dims up to a multiple of 16
+        output_params=["-crf", str(crf), "-preset", "medium"],
     )
     try:
         for frame in frames_iter:

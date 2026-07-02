@@ -88,12 +88,20 @@ def seam_affine(prev_last: torch.Tensor, next_first: torch.Tensor) -> np.ndarray
         src = np.float32([kb[x.queryIdx].pt for x in m])
         dst = np.float32([ka[x.trainIdx].pt for x in m])
         M, inl = cv2.estimateAffine2D(src, dst, method=cv2.RANSAC, ransacReprojThreshold=2.5)
-        return M if M is not None and int(inl.sum()) >= 15 else None
+        if M is None or int(inl.sum()) < 15:
+            return None
+        # sanity: real per-seam drift is small. An extreme scale means the two frames didn't
+        # correspond (e.g. a big content jump at the cut) and the fit is unreliable -> reject,
+        # so we don't apply (and cumulatively cascade) a bogus zoom that destroys resolution.
+        sx, sy = np.hypot(M[0, 0], M[1, 0]), np.hypot(M[0, 1], M[1, 1])
+        if not (0.92 <= sx <= 1.08 and 0.92 <= sy <= 1.08):
+            return None
+        return M
 
     M = fit(_bg_mask(A, B))          # background-locked fit
     if M is None:                    # fall back to whole-frame if too few background matches
         M = fit(None)
-    H = np.eye(3, dtype=np.float64)
+    H = np.eye(3, dtype=np.float64)  # identity when unreliable (no bogus warp)
     if M is not None:
         H[:2] = M
     return H
@@ -198,6 +206,7 @@ def normalize_chain(
     make_slow: bool = True,
     interpolate: int = 0,
     interp_backend: str = "rife",
+    ramp_frames: int = 12,
     progress=None,
 ) -> ChainResult:
     """Normalize a chain of clips so the cuts are invisible; write the full result and a
@@ -209,6 +218,12 @@ def normalize_chain(
     (no motion), so alignment is cleaner. Pass an int (``1`` = common single-frame conditioning,
     default; ``0`` = clips already continuous), or ``"auto"`` to detect K **per seam** (for
     generators that repeat a variable number of frames). If None, derives from ``drop_dup``.
+
+    ``mode``: ``tight`` / ``balanced`` map every clip into one shared space (globally consistent,
+    but corrections accumulate down a long chain -> later clips get zoomed/dulled). ``local``
+    instead corrects only each clip's head with a ramp that fades to the clip's ORIGINAL over
+    ``ramp_frames`` frames (no accumulation -> resolution & colour preserved; clips keep their own
+    look, only the cuts are smoothed). Use ``local`` for long chains where accumulation degrades.
 
     ``interpolate`` (v2): insert this many synthesized in-between frames at each seam to smooth
     the residual motion step (0 = off). ``interp_backend``: ``rife`` (learned, handles occlusion;
@@ -272,42 +287,56 @@ def normalize_chain(
         align_f[i] = to_float(head_buf[i][ai:ai + 1])[0]
         heads[i] = to_float(head_buf[i][hs:hs + WIN])
 
-    # ---- geometry: cumulative full affine to clip-0 space ----
-    cum_H = [np.eye(3)]
-    for i in range(1, N):
-        cum_H.append(cum_H[-1] @ seam_affine(last_f[i - 1], align_f[i]))
-    sxy = [axis_scales(H) for H in cum_H]
-    zoom_x = max(1.0 / min(s[0] for s in sxy), 1.0)
-    zoom_y = max(1.0 / min(s[1] for s in sxy), 1.0)
-    cz = np.array([[zoom_x, 0, (1 - zoom_x) * Ww / 2],
-                   [0, zoom_y, (1 - zoom_y) * Hh / 2], [0, 0, 1]], dtype=np.float64)
-    Ms = [(cz @ H)[:2].astype(np.float32) for H in cum_H]
-
-    # ---- colour / exposure / sharpness ----
-    if mode == "tight":
-        cum_g, cum_b, cum_s = [np.ones(3)], [np.zeros(3)], [1.0]
+    # ---- transforms per clip: cumulative (tight/balanced) or per-seam LOCAL (ramped) ----
+    local = (mode == "local")
+    I2 = np.array([[1, 0, 0], [0, 1, 0]], dtype=np.float32)
+    if not local:
+        # geometry: cumulative full affine to clip-0 space + a border-removing crop-zoom
+        cum_H = [np.eye(3)]
         for i in range(1, N):
+            cum_H.append(cum_H[-1] @ seam_affine(last_f[i - 1], align_f[i]))
+        sxy = [axis_scales(H) for H in cum_H]
+        zoom_x = max(1.0 / min(s[0] for s in sxy), 1.0)
+        zoom_y = max(1.0 / min(s[1] for s in sxy), 1.0)
+        cz = np.array([[zoom_x, 0, (1 - zoom_x) * Ww / 2],
+                       [0, zoom_y, (1 - zoom_y) * Hh / 2], [0, 0, 1]], dtype=np.float64)
+        Ms = [(cz @ H)[:2].astype(np.float32) for H in cum_H]
+        if mode == "tight":
+            cum_g, cum_b, cum_s = [np.ones(3)], [np.zeros(3)], [1.0]
+            for i in range(1, N):
+                g, b, sh = color_sharp_fit(tails[i - 1], heads[i])
+                cum_g.append(cum_g[-1] * g)
+                cum_b.append(cum_g[-2] * b + cum_b[-1])
+                cum_s.append(cum_s[-1] * sh)
+        else:  # balanced: map every clip to the average look
+            tgt_m = torch.stack([s[0] for s in stats]).mean(0)
+            tgt_s = torch.stack([s[1] for s in stats]).mean(0)
+            tgt_h = float(np.mean([s[2] for s in stats]))
+            cum_g, cum_b, cum_s = [], [], []
+            for i in range(N):
+                g = (tgt_s / (stats[i][1] + 1e-5)).clamp(0.85, 1.18)
+                cum_g.append(g.numpy())
+                cum_b.append((tgt_m - g * stats[i][0]).numpy())
+                cum_s.append(float(np.clip(tgt_h / (stats[i][2] + 1e-5), 0.8, 1.25)))
+        cum_L = [torch.ones(3, *GRID)]
+        for i in range(1, N):
+            pf = apply_frame(last_f[i - 1], Ms[i - 1], cum_g[i - 1], cum_b[i - 1], cum_s[i - 1], Ww, Hh)
+            nf = apply_frame(align_f[i], Ms[i], cum_g[i], cum_b[i], cum_s[i], Ww, Hh)
+            cum_L.append((cum_L[-1] * lighting_gain(pf, nf)).clamp(0.80, 1.25))
+    else:
+        # LOCAL: per-seam transform (clip i -> clip i-1's ORIGINAL tail), NOT composed. Applied
+        # only to each clip's head with a ramp fading to identity (see render), so clip bodies
+        # stay original -> no cumulative zoom/colour buildup, resolution & colour preserved, and
+        # a bad seam fit is contained to that clip's first few frames.
+        Ms = [I2.copy()]
+        cum_g, cum_b, cum_s, cum_L = [np.ones(3)], [np.zeros(3)], [1.0], [torch.ones(3, *GRID)]
+        for i in range(1, N):
+            Ms.append(seam_affine(last_f[i - 1], align_f[i])[:2].astype(np.float32))
             g, b, sh = color_sharp_fit(tails[i - 1], heads[i])
-            cum_g.append(cum_g[-1] * g)
-            cum_b.append(cum_g[-2] * b + cum_b[-1])
-            cum_s.append(cum_s[-1] * sh)
-    else:  # balanced: map every clip to the average look
-        tgt_m = torch.stack([s[0] for s in stats]).mean(0)
-        tgt_s = torch.stack([s[1] for s in stats]).mean(0)
-        tgt_h = float(np.mean([s[2] for s in stats]))
-        cum_g, cum_b, cum_s = [], [], []
-        for i in range(N):
-            g = (tgt_s / (stats[i][1] + 1e-5)).clamp(0.85, 1.18)
-            cum_g.append(g.numpy())
-            cum_b.append((tgt_m - g * stats[i][0]).numpy())
-            cum_s.append(float(np.clip(tgt_h / (stats[i][2] + 1e-5), 0.8, 1.25)))
-
-    # ---- lighting: spatially-varying low-freq gain, chained in reference space ----
-    cum_L = [torch.ones(3, *GRID)]
-    for i in range(1, N):
-        pf = apply_frame(last_f[i - 1], Ms[i - 1], cum_g[i - 1], cum_b[i - 1], cum_s[i - 1], Ww, Hh)
-        nf = apply_frame(align_f[i], Ms[i], cum_g[i], cum_b[i], cum_s[i], Ww, Hh)
-        cum_L.append((cum_L[-1] * lighting_gain(pf, nf)).clamp(0.80, 1.25))
+            cum_g.append(g); cum_b.append(b); cum_s.append(sh)
+            nf = apply_frame(align_f[i], Ms[i], g, b, sh, Ww, Hh)
+            cum_L.append(lighting_gain(last_f[i - 1], nf).clamp(0.80, 1.25))
+        sxy = [axis_scales(np.vstack([M, [0.0, 0.0, 1.0]])) for M in Ms]
 
     # ---- PHASE 2: render (stream one clip at a time), drop duplicate seam frames,
     #      optionally insert interpolated in-between frames at each seam (v2) ----
@@ -318,9 +347,28 @@ def normalize_chain(
         itp = get_interpolator(interp_backend, device=("cuda" if torch.cuda.is_available() else "cpu"))
         prog("render", 0.30, f"Interpolation on ({getattr(itp, 'backend', interp_backend)}, K={interpolate})")
 
-    def _apply(fr_u8, k, i):
+    def _apply_w(fr_u8, k, i, w):
+        """Apply clip i's transform scaled toward identity by ``w`` (1=full, 0=original)."""
         f = to_float(fr_u8[k:k + 1])[0]
-        return apply_frame(f, Ms[i], cum_g[i], cum_b[i], cum_s[i], Ww, Hh, cum_L[i])
+        if w <= 1e-3:
+            return f.clamp(0, 1)                                 # untouched -> full original quality
+        if w >= 0.999:
+            return apply_frame(f, Ms[i], cum_g[i], cum_b[i], cum_s[i], Ww, Hh, cum_L[i])
+        Mw = (I2 + w * (Ms[i] - I2)).astype(np.float32)
+        gw = 1.0 + w * (cum_g[i] - 1.0)
+        bw = w * cum_b[i]
+        sw = 1.0 + w * (cum_s[i] - 1.0)
+        Lw = 1.0 + w * (cum_L[i] - 1.0)
+        return apply_frame(f, Mw, gw, bw, sw, Ww, Hh, Lw)
+
+    def _w(i, kk):
+        """Per-frame correction weight. Cumulative modes: 1 everywhere. Local: ramp from 1 at
+        the seam to 0 over ``ramp_frames`` (clip 0 and clip bodies stay original)."""
+        if not local:
+            return 1.0
+        if i == 0:
+            return 0.0
+        return max(0.0, 1.0 - kk / max(ramp_frames, 1))
 
     def gen():
         prev_corr_last = None
@@ -331,16 +379,18 @@ def normalize_chain(
             if (fr.shape[2], fr.shape[3]) != ref_hw:
                 fr = to_uint8(F.interpolate(to_float(fr), size=ref_hw, mode="bilinear", align_corners=False))
             start = ov_list[i] if i > 0 else 0                  # drop the overlap[0..K-1] duplicates
-            first_corr = _apply(fr, start, i)
+            first_corr = _apply_w(fr, start, i, _w(i, 0))
             if itp is not None and i > 0 and prev_corr_last is not None:   # synth midpoints at the seam
                 for j in range(1, interpolate + 1):
                     t = j / (interpolate + 1)
                     yield to_uint8(itp.interpolate(prev_corr_last, first_corr, t))
             yield to_uint8(first_corr)
+            corr, kk = first_corr, 1
             for k in range(start + 1, fr.shape[0]):
-                corr = _apply(fr, k, i)
+                corr = _apply_w(fr, k, i, _w(i, kk))
+                kk += 1
                 yield to_uint8(corr)
-            prev_corr_last = corr if fr.shape[0] > start + 1 else first_corr
+            prev_corr_last = corr
             del v, fr
 
     n = save_video_stream(full_path, gen(), fps=fps)

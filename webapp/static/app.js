@@ -26,6 +26,7 @@ function move(id, d) {
   render();
 }
 function fmtSize(b) { return b > 1e6 ? (b / 1e6).toFixed(1) + " MB" : (b / 1e3).toFixed(0) + " KB"; }
+function clearDropMarks() { document.querySelectorAll(".slot.drop-before,.slot.drop-after").forEach((n) => n.classList.remove("drop-before", "drop-after")); }
 
 function render() {
   slotsEl.innerHTML = "";
@@ -35,8 +36,9 @@ function render() {
     li.draggable = true;
     li.dataset.id = s.id;
     li.innerHTML = `
+      <span class="grip" title="드래그해서 순서 변경">⋮⋮</span>
       <span class="idx">${i + 1}</span>
-      <video class="thumb" src="${s.url}#t=0.1" muted preload="metadata"></video>
+      <video class="thumb" src="${s.url}#t=0.1" muted preload="metadata" draggable="false"></video>
       <div class="meta"><div class="name">${s.file.name}</div><div class="size">${fmtSize(s.file.size)}</div></div>
       <div class="slot-actions">
         <button class="mini" data-act="up" ${i === 0 ? "disabled" : ""}>▲</button>
@@ -46,19 +48,30 @@ function render() {
     li.querySelector('[data-act="up"]').onclick = () => move(s.id, -1);
     li.querySelector('[data-act="down"]').onclick = () => move(s.id, 1);
     li.querySelector('[data-act="rm"]').onclick = () => removeSlot(s.id);
-    // drag reorder
-    li.addEventListener("dragstart", (e) => { e.dataTransfer.setData("id", s.id); li.classList.add("dragging"); });
-    li.addEventListener("dragend", () => li.classList.remove("dragging"));
-    li.addEventListener("dragover", (e) => e.preventDefault());
+    // drag reorder (text/plain payload; video is draggable=false so it doesn't hijack)
+    li.addEventListener("dragstart", (e) => {
+      e.dataTransfer.setData("text/plain", s.id);
+      e.dataTransfer.effectAllowed = "move";
+      li.classList.add("dragging");
+    });
+    li.addEventListener("dragend", () => { li.classList.remove("dragging"); clearDropMarks(); });
+    li.addEventListener("dragover", (e) => {
+      e.preventDefault();
+      e.dataTransfer.dropEffect = "move";
+      const below = e.clientY > li.getBoundingClientRect().top + li.offsetHeight / 2;
+      clearDropMarks();
+      li.classList.add(below ? "drop-after" : "drop-before");
+    });
+    li.addEventListener("dragleave", () => li.classList.remove("drop-before", "drop-after"));
     li.addEventListener("drop", (e) => {
       e.preventDefault();
-      const from = e.dataTransfer.getData("id");
-      const to = s.id;
-      if (from === to) return;
-      const fi = slots.findIndex((x) => x.id === from);
-      const el = slots.splice(fi, 1)[0];
-      const ti = slots.findIndex((x) => x.id === to);
-      slots.splice(ti, 0, el);
+      const from = e.dataTransfer.getData("text/plain");
+      clearDropMarks();
+      if (!from || from === s.id) return;
+      const below = e.clientY > li.getBoundingClientRect().top + li.offsetHeight / 2;
+      const el = slots.splice(slots.findIndex((x) => x.id === from), 1)[0];
+      let ti = slots.findIndex((x) => x.id === s.id);
+      slots.splice(below ? ti + 1 : ti, 0, el);
       render();
     });
     slotsEl.appendChild(li);

@@ -36,7 +36,9 @@ tail = the next clip's anchor). Per clip:
   frames** at each boundary, use **`--overlap K`** (drops K, aligns on the `prev[-1]↔next[K-1]`
   duplicate pair — actually more accurate). Default 1; 0 drops nothing; **`--overlap auto`
   detects K per seam** (when you don't know how many frames repeat).
-- modes: `tight` (max seam match, default) / `balanced` (keep clips natural)
+- modes: `tight` (max seam match, default) / `balanced` (keep clips natural) / **`local`** (ramp
+  the correction only on each clip's head, bodies stay original → no accumulation, **preserves
+  resolution & colour**; recommended for long chains)
 
 **Stage 2 · Interpolation (learned).** What remains is subject motion (`prev[-1]`≠`next[0]` in time).
 Synthesize K midpoints per seam (`K=1` + duplicate-drop = length-preserving).
