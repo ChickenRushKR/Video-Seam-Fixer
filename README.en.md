@@ -35,10 +35,11 @@ cut, and it **accumulates** — by D the image is noticeably more zoomed and bri
 
 ![Seam example](docs/seam_example.png)
 
-> `A_last` and `B_first` look almost identical, but overlaying them at 50% (3rd) reveals a
-> **ghost/double** — that *is* the seam (scale/position/colour mismatch). After alignment the
-> overlay (4th) is crisp on background & edges; the remaining hand double is *genuine subject
-> motion*, which is what [Stage 2 interpolation](#stage-2--seam-motion-interpolation-learned) handles.
+> Top: `A_last` (prev clip end) and `B_first` (next clip start) — nearly identical. Bottom-left:
+> amplify their difference (×5) and **the whole frame's edges glow** — bridge, ground, lights =
+> the seam (scale/position/colour mismatch, mean diff 0.032). Bottom-right: after alignment the
+> background edges **go blue** (0.013); the orange that remains is **just the person** = genuine
+> subject motion that alignment can't touch, which [Stage 2](#stage-2--seam-motion-interpolation-learned) handles.
 
 **What had to be fixed (and the wrong turns).**
 - First guessed it was *colour* → matching colour alone added a red cast and made it worse
