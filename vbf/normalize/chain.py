@@ -161,10 +161,28 @@ def lighting_gain(pf: torch.Tensor, nf: torch.Tensor) -> torch.Tensor:
     return F.adaptive_avg_pool2d(gmap, GRID)
 
 
+def cover_zoom(M: np.ndarray, W: int, H: int, margin: float = 0.002) -> np.ndarray:
+    """Compose a centre zoom onto affine ``M`` (2x3) so the warped frame fully covers the WxH
+    canvas — no exposed border (which would otherwise be filled by the border mode, e.g. the
+    top/bottom "mirror"). Zooms only as much as the transform's shrink/shift requires."""
+    H3 = np.vstack([M, [0.0, 0.0, 1.0]]).astype(np.float64)
+    corners = np.array([[0, 0, 1], [W, 0, 1], [W, H, 1], [0, H, 1]], dtype=np.float64).T
+    tc = H3 @ corners
+    xs, ys = tc[0], tc[1]
+    gap_x = max(max(0.0, xs.min()), max(0.0, W - xs.max()))   # worst horizontal shortfall
+    gap_y = max(max(0.0, ys.min()), max(0.0, H - ys.max()))
+    z = max(W / max(W - 2 * gap_x, 1e-3), H / max(H - 2 * gap_y, 1e-3), 1.0) * (1 + margin)
+    if z <= 1.0 + 1e-4:
+        return M.astype(np.float32)
+    Z = np.array([[z, 0, (1 - z) * W / 2], [0, z, (1 - z) * H / 2], [0, 0, 1]], dtype=np.float64)
+    return (Z @ H3)[:2].astype(np.float32)
+
+
 def apply_frame(f, M, g, b, sharp, Ww, Hh, L=None):
     """geometry -> colour(gain,bias) -> sharpness -> optional low-freq lighting, on [3,H,W]."""
     img = _np(f)
-    w = cv2.warpAffine(img, M, (Ww, Hh), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+    M = cover_zoom(np.asarray(M, dtype=np.float64), Ww, Hh)     # no exposed border (no mirror)
+    w = cv2.warpAffine(img, M, (Ww, Hh), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
     x = torch.from_numpy(w).permute(2, 0, 1).float() / 255.0
     x = x * torch.from_numpy(g).float().view(3, 1, 1) + torch.from_numpy(b).float().view(3, 1, 1)
     if abs(sharp - 1.0) > 1e-3:
