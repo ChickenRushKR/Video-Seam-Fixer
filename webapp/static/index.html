@@ -36,9 +36,9 @@
           <option value="balanced">balanced — 클립 자연스러움 우선</option>
         </select>
       </label>
-      <label class="opt check">
-        <input type="checkbox" id="dropDup" checked />
-        <span>중복 프레임 제거 <span class="hint">(경계 freeze 방지)</span></span>
+      <label class="opt">
+        <span>경계 중복 프레임 수 <span class="hint">(생성 시 겹친 프레임; 보통 1)</span></span>
+        <input type="number" id="overlap" value="1" min="0" max="30" step="1" style="width:80px" />
       </label>
       <label class="opt check">
         <input type="checkbox" id="interpOn" />

@@ -15,7 +15,8 @@ def main():
     ap.add_argument("clips", nargs="+", help="clip paths in order (or a single '2'/'3' sample id)")
     ap.add_argument("--out", default=None, help="output dir")
     ap.add_argument("--mode", default="tight", choices=["tight", "balanced"])
-    ap.add_argument("--no-drop-dup", action="store_true", help="keep the duplicate seam frame")
+    ap.add_argument("--no-drop-dup", action="store_true", help="keep the duplicate seam frame (= --overlap 0)")
+    ap.add_argument("--overlap", type=int, default=None, help="duplicate frames per seam to drop (0/1/K; default 1). Use K if the generator repeated K frames at each boundary")
     ap.add_argument("--no-slow", action="store_true", help="skip the boundary slow-mo comparison")
     ap.add_argument("--interpolate", type=int, default=0, help="v2: insert K synthesized frames per seam (0=off; 1 keeps length)")
     ap.add_argument("--interp-backend", default="rife", choices=["rife", "flow"], help="interpolation backend (rife falls back to flow)")
@@ -33,9 +34,9 @@ def main():
         print(f"[{frac*100:5.1f}%] {stage:8} {msg}")
 
     r = normalize_chain(clips, out, mode=args.mode, drop_dup=not args.no_drop_dup,
-                        make_slow=not args.no_slow, interpolate=args.interpolate,
-                        interp_backend=args.interp_backend, progress=prog)
-    print(f"\n{r.num_frames}f @ {r.fps}fps in {r.seconds}s -> {r.full_path}")
+                        overlap=args.overlap, make_slow=not args.no_slow,
+                        interpolate=args.interpolate, interp_backend=args.interp_backend, progress=prog)
+    print(f"\n{r.num_frames}f @ {r.fps}fps in {r.seconds}s (overlap={r.overlap}) -> {r.full_path}")
     if r.interpolate:
         print(f"interpolation: {r.interpolate} frame(s)/seam via {r.interp_backend}")
     if r.slow_path:

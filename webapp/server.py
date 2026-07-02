@@ -41,7 +41,7 @@ def _set(job_id, **kw):
         JOBS[job_id].update(kw)
 
 
-def _run_job(job_id, clip_paths, out_dir, mode, drop_dup, interpolate, interp_backend):
+def _run_job(job_id, clip_paths, out_dir, mode, overlap, interpolate, interp_backend):
     t0 = time.time()
 
     def prog(stage, frac, message):
@@ -50,7 +50,7 @@ def _run_job(job_id, clip_paths, out_dir, mode, drop_dup, interpolate, interp_ba
 
     try:
         _set(job_id, status="running")
-        res = normalize_chain(clip_paths, out_dir, mode=mode, drop_dup=drop_dup,
+        res = normalize_chain(clip_paths, out_dir, mode=mode, overlap=overlap,
                               make_slow=True, interpolate=interpolate,
                               interp_backend=interp_backend, progress=prog)
         _set(job_id, status="done", frac=1.0, stage="done", message="Done",
@@ -58,6 +58,7 @@ def _run_job(job_id, clip_paths, out_dir, mode, drop_dup, interpolate, interp_ba
              result={
                  "num_frames": res.num_frames, "fps": res.fps, "seconds": res.seconds,
                  "mode": res.mode, "seams": res.seams, "transforms": res.transforms,
+                 "overlap": res.overlap,
                  "interpolate": res.interpolate, "interp_backend": res.interp_backend,
                  "has_full": bool(res.full_path and os.path.exists(res.full_path)),
                  "has_slow": bool(res.slow_path and os.path.exists(res.slow_path)),
@@ -84,7 +85,10 @@ def api_run():
     if len(files) < 2:
         return jsonify(error="add at least 2 clips"), 400
     mode = request.form.get("mode", "tight")
-    drop_dup = request.form.get("drop_dup", "true") == "true"
+    try:
+        overlap = max(0, min(30, int(request.form.get("overlap", "1"))))
+    except ValueError:
+        overlap = 1
     try:
         interpolate = max(0, min(3, int(request.form.get("interpolate", "0"))))
     except ValueError:
@@ -109,7 +113,7 @@ def api_run():
                         "message": "Queued", "elapsed": 0.0, "out_dir": out_dir,
                         "clips": [os.path.basename(p) for p in clip_paths], "mode": mode}
     threading.Thread(target=_run_job,
-                     args=(job_id, clip_paths, out_dir, mode, drop_dup, interpolate, interp_backend),
+                     args=(job_id, clip_paths, out_dir, mode, overlap, interpolate, interp_backend),
                      daemon=True).start()
     return jsonify(job_id=job_id)
 

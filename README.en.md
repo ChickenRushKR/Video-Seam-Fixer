@@ -32,7 +32,9 @@ so both sides of each cut match and no downstream cut breaks (a local fix would 
 tail = the next clip's anchor). Per clip:
 - **geometry** — full affine (independent x/y scale; anisotropic, so not a similarity transform), matched on the **static background only**
 - **colour/exposure** (per-channel mean+std) · **sharpness** (high-freq) · **lighting** (spatially-varying low-freq gain, subject-masked)
-- **drop the duplicate frame** → freeze becomes normal motion
+- **drop the duplicate frame** → freeze becomes normal motion. If the generator repeated **K
+  frames** at each boundary, use **`--overlap K`** (drops K, aligns on the `prev[-1]↔next[K-1]`
+  duplicate pair — actually more accurate). Default 1; 0 drops nothing.
 - modes: `tight` (max seam match, default) / `balanced` (keep clips natural)
 
 **Stage 2 · Interpolation (learned).** What remains is subject motion (`prev[-1]`≠`next[0]` in time).
