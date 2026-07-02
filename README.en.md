@@ -34,7 +34,8 @@ tail = the next clip's anchor). Per clip:
 - **colour/exposure** (per-channel mean+std) · **sharpness** (high-freq) · **lighting** (spatially-varying low-freq gain, subject-masked)
 - **drop the duplicate frame** → freeze becomes normal motion. If the generator repeated **K
   frames** at each boundary, use **`--overlap K`** (drops K, aligns on the `prev[-1]↔next[K-1]`
-  duplicate pair — actually more accurate). Default 1; 0 drops nothing.
+  duplicate pair — actually more accurate). Default 1; 0 drops nothing; **`--overlap auto`
+  detects K per seam** (when you don't know how many frames repeat).
 - modes: `tight` (max seam match, default) / `balanced` (keep clips natural)
 
 **Stage 2 · Interpolation (learned).** What remains is subject motion (`prev[-1]`≠`next[0]` in time).

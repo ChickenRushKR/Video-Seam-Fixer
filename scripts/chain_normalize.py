@@ -16,7 +16,7 @@ def main():
     ap.add_argument("--out", default=None, help="output dir")
     ap.add_argument("--mode", default="tight", choices=["tight", "balanced"])
     ap.add_argument("--no-drop-dup", action="store_true", help="keep the duplicate seam frame (= --overlap 0)")
-    ap.add_argument("--overlap", type=int, default=None, help="duplicate frames per seam to drop (0/1/K; default 1). Use K if the generator repeated K frames at each boundary")
+    ap.add_argument("--overlap", default=None, help="duplicate frames per seam to drop: int (0/1/K, default 1) or 'auto' to detect per seam")
     ap.add_argument("--no-slow", action="store_true", help="skip the boundary slow-mo comparison")
     ap.add_argument("--interpolate", type=int, default=0, help="v2: insert K synthesized frames per seam (0=off; 1 keeps length)")
     ap.add_argument("--interp-backend", default="rife", choices=["rife", "flow"], help="interpolation backend (rife falls back to flow)")
@@ -33,8 +33,11 @@ def main():
     def prog(stage, frac, msg):
         print(f"[{frac*100:5.1f}%] {stage:8} {msg}")
 
+    ov = args.overlap
+    if ov is not None and ov.lstrip("-").isdigit():
+        ov = int(ov)
     r = normalize_chain(clips, out, mode=args.mode, drop_dup=not args.no_drop_dup,
-                        overlap=args.overlap, make_slow=not args.no_slow,
+                        overlap=ov, make_slow=not args.no_slow,
                         interpolate=args.interpolate, interp_backend=args.interp_backend, progress=prog)
     print(f"\n{r.num_frames}f @ {r.fps}fps in {r.seconds}s (overlap={r.overlap}) -> {r.full_path}")
     if r.interpolate:
@@ -45,7 +48,7 @@ def main():
     print("colour gain:", r.transforms["colour_gain"], " sharpness:", r.transforms["sharpness"],
           " lighting:", r.transforms["lighting_gain"])
     for s in r.seams:
-        print(f"  seam {s['pair']}: raw_gap {s['raw_gap']}  scale {s['scale_x_pct']}/{s['scale_y_pct']}%")
+        print(f"  seam {s['pair']}: overlap={s['overlap']}  raw_gap {s['raw_gap']}  scale {s['scale_x_pct']}/{s['scale_y_pct']}%")
 
 
 if __name__ == "__main__":

@@ -105,6 +105,30 @@ def axis_scales(H: np.ndarray) -> tuple[float, float]:
     return float(np.hypot(L[0, 0], L[1, 0])), float(np.hypot(L[0, 1], L[1, 1]))
 
 
+def detect_overlap(prev_tail: torch.Tensor, next_head: torch.Tensor, max_k: int = 32) -> int:
+    """How many leading frames of ``next_head`` duplicate the trailing frames of ``prev_tail``.
+
+    A duplicated frame matches ``prev[-1]`` far better than the clip's normal frame-to-frame
+    motion. Find the next-clip frame ``j`` closest to ``prev[-1]``; if that match (and the whole
+    ``next[0:j+1]`` vs ``prev[-j-1:]`` block) is well below the motion baseline it's a genuine
+    K=j+1 overlap. Returns 0 when there's no clear duplication. Frames are float [.,3,H,W]."""
+    plast = prev_tail[-1]
+    nm = (float((prev_tail[1:] - prev_tail[:-1]).abs().flatten(1).mean(1).mean())
+          if prev_tail.shape[0] > 1 else 0.02)
+    nm = max(nm, 1e-4)
+    K = min(max_k, next_head.shape[0] - 1)
+    e = [float((next_head[j] - plast).abs().mean()) for j in range(K + 1)]
+    j = int(np.argmin(e))
+    if e[j] < 0.5 * nm:                                   # next[j] ~ prev[-1] (a duplicate)
+        m = j + 1
+        if m <= prev_tail.shape[0]:
+            blk = float((next_head[:m] - prev_tail[-m:]).abs().mean())
+            if blk >= 0.6 * nm:                           # block doesn't line up -> not a clean overlap
+                return 1 if e[0] < 0.5 * nm else 0
+        return m
+    return 0                                              # no clear duplication
+
+
 def color_sharp_fit(prev_win: torch.Tensor, next_win: torch.Tensor):
     """Match next_win -> prev_win: per-channel colour gain/bias (mean+std) and a scalar
     sharpness (high-freq energy) ratio. Returns (gain[3], bias[3], sharp)."""
@@ -157,7 +181,7 @@ class ChainResult:
     seams: list[dict] = field(default_factory=list)   # per-seam metrics
     seconds: float = 0.0
     transforms: dict = field(default_factory=dict)     # cumulative scale/colour/lighting per clip
-    overlap: int = 1                                   # duplicate frames dropped per seam
+    overlap: object = 1                                # duplicate frames dropped per seam (int or "auto[...]")
     interpolate: int = 0                               # midpoints inserted per seam (0 = off)
     interp_backend: str = ""                           # backend actually used
 
@@ -179,12 +203,12 @@ def normalize_chain(
     """Normalize a chain of clips so the cuts are invisible; write the full result and a
     side-by-side (raw|fixed) boundary slow-motion.
 
-    ``overlap`` (int): how many frames each next clip **duplicates** from the previous clip's
-    tail (``next[0..overlap-1] ≈ prev[-overlap..-1]``). Those duplicates are dropped, and the
-    per-seam transform is estimated from the true corresponding pair ``(prev[-1], next[overlap-1])``
-    — a pure-drift pair (no motion), so alignment is cleaner. ``overlap=1`` is the common
-    single-frame conditioning case (default). ``overlap=0`` = clips are already continuous
-    (nothing dropped). If ``overlap`` is None it derives from ``drop_dup`` (True→1, False→0).
+    ``overlap``: how many frames each next clip **duplicates** from the previous clip's tail
+    (``next[0..K-1] ≈ prev[-K..-1]``). Those duplicates are dropped, and the per-seam transform
+    is estimated from the true corresponding pair ``(prev[-1], next[K-1])`` — a pure-drift pair
+    (no motion), so alignment is cleaner. Pass an int (``1`` = common single-frame conditioning,
+    default; ``0`` = clips already continuous), or ``"auto"`` to detect K **per seam** (for
+    generators that repeat a variable number of frames). If None, derives from ``drop_dup``.
 
     ``interpolate`` (v2): insert this many synthesized in-between frames at each seam to smooth
     the residual motion step (0 = off). ``interp_backend``: ``rife`` (learned, handles occlusion;
@@ -198,13 +222,14 @@ def normalize_chain(
     if len(clip_paths) < 2:
         raise ValueError("need at least 2 clips")
     N = len(clip_paths)
-    ov = overlap if overlap is not None else (1 if drop_dup else 0)   # duplicate frames per seam
-    ov = max(0, ov)
+    auto = isinstance(overlap, str) and overlap.lower() == "auto"
+    scalar_ov = 0
+    if not auto:
+        scalar_ov = max(0, int(overlap) if overlap is not None else (1 if drop_dup else 0))
+    DMAX = 40   # frames kept at each clip edge for overlap detection + post-overlap head window
 
-    # ---- PHASE 1: read each clip's seam neighbourhood + stats (one clip at a time) ----
-    # align_f[i] = the next-clip frame that DUPLICATES prev[-1] (index overlap-1); heads skip the
-    # overlapping duplicates so colour/sharpness stats use genuine post-seam content.
-    align_f, last_f, heads, tails, lengths, stats = [], [], [], [], [], []
+    # ---- PHASE 1: read each clip's edge buffers + stats (one clip at a time) ----
+    head_buf, tail_buf, lengths, stats = [], [], [], []   # uint8 edge buffers (full res)
     fps = 24.0
     ref_hw = None
     for i, p in enumerate(clip_paths):
@@ -216,19 +241,36 @@ def normalize_chain(
         fr = v.frames
         if (fr.shape[2], fr.shape[3]) != ref_hw:            # keep the chain a single canvas size
             fr = to_uint8(F.interpolate(to_float(fr), size=ref_hw, mode="bilinear", align_corners=False))
-        T = fr.shape[0]
-        lengths.append(T)
-        ai = min(max(ov - 1, 0), T - 1)               # frame duplicating prev[-1]
-        hs = min(ov, T - 1)                            # post-overlap head start
-        align_f.append(to_float(fr[ai:ai + 1])[0])
-        last_f.append(to_float(fr[-1:])[0])
-        heads.append(to_float(fr[hs:hs + WIN]))
-        tails.append(to_float(fr[-WIN:]))
+        lengths.append(fr.shape[0])
+        head_buf.append(fr[:DMAX].clone())
+        tail_buf.append(fr[-DMAX:].clone())
         sub = to_float(fr[:: max(1, fr.shape[0] // 20)])
         stats.append((sub.mean((0, 2, 3)), sub.std((0, 2, 3)), float((sub - _blur(sub)).std())))
         del v, fr
 
     Hh, Ww = ref_hw
+
+    # ---- per-seam overlap (auto-detected or fixed) ----
+    ov_list = [0] * N
+    for i in range(1, N):
+        if auto:
+            ov_list[i] = detect_overlap(to_float(tail_buf[i - 1]), to_float(head_buf[i]))
+        else:
+            ov_list[i] = scalar_ov
+        ov_list[i] = min(ov_list[i], lengths[i] - 1)        # never drop a whole clip
+    if auto:
+        prog("analyze", 0.30, f"Detected overlap per seam: {ov_list[1:]}")
+
+    # ---- derive seam frames per seam: align_f (duplicates prev[-1]), heads (post-overlap), tails ----
+    align_f, last_f, heads, tails = [None] * N, [None] * N, [None] * N, [None] * N
+    for i in range(N):
+        last_f[i] = to_float(tail_buf[i][-1:])[0]
+        tails[i] = to_float(tail_buf[i][-WIN:])
+        k = ov_list[i]
+        ai = min(max(k - 1, 0), head_buf[i].shape[0] - 1)   # frame duplicating prev[-1]
+        hs = min(k, head_buf[i].shape[0] - 1)               # post-overlap head start
+        align_f[i] = to_float(head_buf[i][ai:ai + 1])[0]
+        heads[i] = to_float(head_buf[i][hs:hs + WIN])
 
     # ---- geometry: cumulative full affine to clip-0 space ----
     cum_H = [np.eye(3)]
@@ -288,7 +330,7 @@ def normalize_chain(
             fr = v.frames
             if (fr.shape[2], fr.shape[3]) != ref_hw:
                 fr = to_uint8(F.interpolate(to_float(fr), size=ref_hw, mode="bilinear", align_corners=False))
-            start = min(ov, fr.shape[0] - 1) if i > 0 else 0    # drop the overlap[0..ov-1] duplicates
+            start = ov_list[i] if i > 0 else 0                  # drop the overlap[0..K-1] duplicates
             first_corr = _apply(fr, start, i)
             if itp is not None and i > 0 and prev_corr_last is not None:   # synth midpoints at the seam
                 for j in range(1, interpolate + 1):
@@ -309,7 +351,7 @@ def normalize_chain(
         if i > 0:
             emitted += interpolate           # midpoints inserted before this clip's frames
             fix_seam.append(emitted)         # window centres on the interpolated seam region
-        emitted += lengths[i] - (min(ov, lengths[i] - 1) if i > 0 else 0)
+        emitted += lengths[i] - (ov_list[i] if i > 0 else 0)
     acc = 0
     for i in range(N):
         if i > 0:
@@ -319,7 +361,8 @@ def normalize_chain(
     seams = []
     for i in range(1, N):
         raw_gap = float((align_f[i] - last_f[i - 1]).abs().mean())   # drift on the duplicate pair
-        seams.append({"index": i, "pair": f"{i}->{i + 1}", "raw_gap": round(raw_gap, 4),
+        seams.append({"index": i, "pair": f"{i}->{i + 1}", "overlap": ov_list[i],
+                      "raw_gap": round(raw_gap, 4),
                       "scale_x_pct": round((sxy[i][0] - 1) * 100, 2),
                       "scale_y_pct": round((sxy[i][1] - 1) * 100, 2)})
 
@@ -333,7 +376,7 @@ def normalize_chain(
     return ChainResult(
         full_path=full_path, slow_path=slow_path, num_frames=n, fps=fps, mode=mode,
         seams=seams, seconds=round(time.time() - t0, 1),
-        overlap=ov,
+        overlap=(f"auto{ov_list[1:]}" if auto else scalar_ov),
         interpolate=interpolate,
         interp_backend=(getattr(itp, "backend", interp_backend) if itp is not None else ""),
         transforms={

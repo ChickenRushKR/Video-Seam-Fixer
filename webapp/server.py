@@ -85,10 +85,14 @@ def api_run():
     if len(files) < 2:
         return jsonify(error="add at least 2 clips"), 400
     mode = request.form.get("mode", "tight")
-    try:
-        overlap = max(0, min(30, int(request.form.get("overlap", "1"))))
-    except ValueError:
-        overlap = 1
+    ov_raw = (request.form.get("overlap", "1") or "1").strip().lower()
+    if ov_raw == "auto":
+        overlap = "auto"
+    else:
+        try:
+            overlap = max(0, min(60, int(ov_raw)))
+        except ValueError:
+            overlap = 1
     try:
         interpolate = max(0, min(3, int(request.form.get("interpolate", "0"))))
     except ValueError:
