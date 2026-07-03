@@ -35,11 +35,13 @@ import torch
 import torch.nn.functional as F
 
 from vbf.io.video_io import load_video, save_video_stream, to_float, to_uint8
+from vbf.metrics.perceptual import delta_e76, ssim
 
 WIN = 8               # frames each side of a seam for colour/exposure/sharpness stats
 GRID = (24, 14)       # lighting-gain grid (gh, gw) — small => very smooth, cannot form a blob
 SLOW_RADIUS = 15      # frames each side of a seam shown in the slow-motion comparison
 SLOW_FACTOR = 4       # slow-motion factor for the boundary comparison
+CROP_CAP = 1.08       # a correction needing more border crop than this is a bogus fit -> reject
 
 
 # --------------------------------------------------------------------------- #
@@ -68,10 +70,23 @@ def _bg_mask(A: np.ndarray, B: np.ndarray) -> np.ndarray:
     return cv2.erode(bg, np.ones((21, 21), np.uint8))
 
 
+def _sane_scale(M: np.ndarray, lo: float = 0.92, hi: float = 1.08) -> bool:
+    """Reject an affine whose axis scale is implausibly large: real per-seam drift is small, so an
+    extreme scale means the two frames didn't correspond (a content jump at the cut) and the fit
+    is unreliable — return identity rather than cascade a bogus zoom that destroys resolution."""
+    sx, sy = np.hypot(M[0, 0], M[1, 0]), np.hypot(M[0, 1], M[1, 1])
+    return lo <= sx <= hi and lo <= sy <= hi
+
+
 def seam_affine(prev_last: torch.Tensor, next_first: torch.Tensor) -> np.ndarray:
-    """FULL affine (6-DOF: independent x/y scale + shear + rot + shift) mapping
-    ``next_first -> prev_last``, fit on STATIC-BACKGROUND features only (the moving
-    subject would otherwise bias the global transform). 3x3; identity on failure."""
+    """FULL affine (6-DOF: independent x/y scale + shear + rot + shift) mapping ``next_first ->
+    prev_last`` (as a warpAffine sampling matrix), fit on STATIC-BACKGROUND features only (the
+    moving subject would otherwise bias the global transform). 3x3; identity when unreliable.
+
+    NOTE: an ECC photometric refinement and a temporal-variance background mask were evaluated and
+    dropped — both underperformed this sparse 2-frame ORB fit on the test chains (ECC diverges on
+    the per-clip exposure difference; the temporal mask starved the fit of texture). The metric
+    gate downstream (``gate_strength``) is what makes a marginal fit safe."""
     A, B = _np(prev_last), _np(next_first)
     ga, gb = cv2.cvtColor(A, cv2.COLOR_RGB2GRAY), cv2.cvtColor(B, cv2.COLOR_RGB2GRAY)
     orb = cv2.ORB_create(6000)
@@ -88,13 +103,7 @@ def seam_affine(prev_last: torch.Tensor, next_first: torch.Tensor) -> np.ndarray
         src = np.float32([kb[x.queryIdx].pt for x in m])
         dst = np.float32([ka[x.trainIdx].pt for x in m])
         M, inl = cv2.estimateAffine2D(src, dst, method=cv2.RANSAC, ransacReprojThreshold=2.5)
-        if M is None or int(inl.sum()) < 15:
-            return None
-        # sanity: real per-seam drift is small. An extreme scale means the two frames didn't
-        # correspond (e.g. a big content jump at the cut) and the fit is unreliable -> reject,
-        # so we don't apply (and cumulatively cascade) a bogus zoom that destroys resolution.
-        sx, sy = np.hypot(M[0, 0], M[1, 0]), np.hypot(M[0, 1], M[1, 1])
-        if not (0.92 <= sx <= 1.08 and 0.92 <= sy <= 1.08):
+        if M is None or int(inl.sum()) < 15 or not _sane_scale(M):
             return None
         return M
 
@@ -161,27 +170,89 @@ def lighting_gain(pf: torch.Tensor, nf: torch.Tensor) -> torch.Tensor:
     return F.adaptive_avg_pool2d(gmap, GRID)
 
 
-def cover_zoom(M: np.ndarray, W: int, H: int, margin: float = 0.002) -> np.ndarray:
-    """Compose a centre zoom onto affine ``M`` (2x3) so the warped frame fully covers the WxH
-    canvas — no exposed border (which would otherwise be filled by the border mode, e.g. the
-    top/bottom "mirror"). Zooms only as much as the transform's shrink/shift requires."""
-    H3 = np.vstack([M, [0.0, 0.0, 1.0]]).astype(np.float64)
-    corners = np.array([[0, 0, 1], [W, 0, 1], [W, H, 1], [0, H, 1]], dtype=np.float64).T
-    tc = H3 @ corners
-    xs, ys = tc[0], tc[1]
-    gap_x = max(max(0.0, xs.min()), max(0.0, W - xs.max()))   # worst horizontal shortfall
-    gap_y = max(max(0.0, ys.min()), max(0.0, H - ys.max()))
-    z = max(W / max(W - 2 * gap_x, 1e-3), H / max(H - 2 * gap_y, 1e-3), 1.0) * (1 + margin)
+def _seam_cost(prev_last: torch.Tensor, cand: torch.Tensor) -> float:
+    """Composite seam dissimilarity (lower = better): pixel L1 + structural + perceptual-colour.
+    Weights put the three on a comparable scale (L1~0.03, 1-SSIM~0.2, dE~4 at a raw seam)."""
+    l1 = float((cand - prev_last).abs().mean())
+    return l1 + 0.15 * (1.0 - ssim(prev_last, cand)) + 0.006 * delta_e76(prev_last, cand)
+
+
+def gate_strength(prev_last: torch.Tensor, build, grid=(0.0, 0.4, 0.7, 1.0)) -> float:
+    """Pick the correction strength alpha in [0,1] that minimizes the seam cost, where
+    ``build(alpha)`` renders the next-clip anchor frame corrected at strength ``alpha``
+    (alpha=0 = raw, untouched). Because alpha=0 is always a candidate, a correction that does
+    not actually reduce the seam is rejected (alpha->0): a robust "do no harm" gate that
+    contains bad per-seam fits (noise on a duplicate pair, an already-sub-baseline seam, a
+    genuine content jump) instead of blindly cascading them. Returns the best alpha."""
+    costs = [(_seam_cost(prev_last, build(a)), a) for a in grid]
+    best_c, best_a = min(costs, key=lambda x: x[0])
+    raw_c = costs[0][0]                          # cost at alpha=0
+    if best_a == 0.0 or best_c >= raw_c - 1e-4:  # no meaningful gain -> don't correct
+        return 0.0
+    lo = max(0.0, best_a - 0.3)                  # local refine for a smoother strength
+    hi = min(1.0, best_a + 0.3)
+    for a in (lo, (lo + best_a) / 2, (best_a + hi) / 2, hi):
+        c = _seam_cost(prev_last, build(a))
+        if c < best_c:
+            best_c, best_a = c, a
+    return round(best_a, 3)
+
+
+def crop_zoom_for(mats, W: int, H: int, margin: float = 0.006) -> np.ndarray:
+    """ONE centre zoom-in (3x3 FORWARD affine) that, composed *before* every geometry transform in
+    ``mats`` (``crop @ M``), pulls all out-of-canvas samples back inside — removing the exposed
+    border a shrink/shift correction would otherwise leave (filled by the border mode = the edge
+    "smear"/mirror). Sized to the worst overflow across all transforms and applied UNIFORMLY, so
+    seam matching is unaffected and the per-seam correction is preserved.
+
+    ``cv2.warpAffine(img, M)`` samples ``img(M⁻¹·x)`` (it treats M as the forward src->dst map and
+    inverts internally), so the SAMPLING matrix is ``M⁻¹`` — a border is exposed where ``M⁻¹``
+    sends an output corner OUTSIDE ``[0,W-1]×[0,H-1]``. We size the zoom to that overflow and
+    return a forward zoom-in ``[[z,0,·],[0,z,·]]`` (z>1); identity when nothing overflows."""
+    cx, cy = (W - 1) / 2.0, (H - 1) / 2.0
+    corners = np.array([[0, 0], [W - 1, 0], [W - 1, H - 1], [0, H - 1]], dtype=np.float64)
+    z = 1.0
+    for M in mats:
+        Se = cv2.invertAffineTransform(np.asarray(M, dtype=np.float64))   # sampling matrix (dst->src)
+        Tc = Se @ np.array([cx, cy, 1.0])         # sample coord at canvas centre
+        Lin = Se[:, :2]
+        for p in corners:
+            S = Lin @ (p - [cx, cy])              # sample offset from centre for this corner
+            for k, lim in enumerate((W - 1, H - 1)):
+                s, t = S[k], Tc[k]
+                if s > 1e-9 and (lim - t) > 1e-6:
+                    z = max(z, s / (lim - t))     # corner samples past the far edge
+                elif s < -1e-9 and t > 1e-6:
+                    z = max(z, -s / t)            # corner samples past the near edge
+    z *= (1 + margin)
     if z <= 1.0 + 1e-4:
-        return M.astype(np.float32)
-    Z = np.array([[z, 0, (1 - z) * W / 2], [0, z, (1 - z) * H / 2], [0, 0, 1]], dtype=np.float64)
-    return (Z @ H3)[:2].astype(np.float32)
+        return np.eye(3, dtype=np.float64)
+    return np.array([[z, 0, cx * (1 - z)], [0, z, cy * (1 - z)], [0, 0, 1]])
 
 
-def apply_frame(f, M, g, b, sharp, Ww, Hh, L=None):
-    """geometry -> colour(gain,bias) -> sharpness -> optional low-freq lighting, on [3,H,W]."""
+def scale_strength(M, g, b, sharp, L, a: float):
+    """Scale a full correction toward identity by ``a`` in [0,1] (a=1 full, a=0 none).
+    Returns (M, g, b, sharp, L) blended with the identity correction."""
+    I2 = np.array([[1, 0, 0], [0, 1, 0]], dtype=np.float32)
+    Mw = (I2 + a * (np.asarray(M, dtype=np.float32) - I2)).astype(np.float32)
+    gw = 1.0 + a * (np.asarray(g, dtype=np.float32) - 1.0)
+    bw = a * np.asarray(b, dtype=np.float32)
+    sw = 1.0 + a * (float(sharp) - 1.0)
+    Lw = (1.0 + a * (L - 1.0)) if L is not None else None
+    return Mw, gw, bw, sw, Lw
+
+
+def apply_frame(f, M, g, b, sharp, Ww, Hh, L=None, crop=None):
+    """geometry -> colour(gain,bias) -> sharpness -> optional low-freq lighting, on [3,H,W].
+    ``crop`` (3x3, optional) is a uniform border-safety zoom composed after the geometry."""
     img = _np(f)
-    M = cover_zoom(np.asarray(M, dtype=np.float64), Ww, Hh)     # no exposed border (no mirror)
+    M3 = np.vstack([np.asarray(M, dtype=np.float64), [0.0, 0.0, 1.0]])
+    if crop is not None:
+        # forward composition: apply the geometry then the centre zoom-in (crop @ M). cv2 inverts
+        # the product internally, so sampling = M⁻¹ @ crop⁻¹ = geometry-sample then zoom-out toward
+        # centre -> every output corner samples inside the canvas -> no exposed border / smear.
+        M3 = np.asarray(crop, dtype=np.float64) @ M3
+    M = M3[:2].astype(np.float32)
     w = cv2.warpAffine(img, M, (Ww, Hh), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
     x = torch.from_numpy(w).permute(2, 0, 1).float() / 255.0
     x = x * torch.from_numpy(g).float().view(3, 1, 1) + torch.from_numpy(b).float().view(3, 1, 1)
@@ -305,28 +376,64 @@ def normalize_chain(
         align_f[i] = to_float(head_buf[i][ai:ai + 1])[0]
         heads[i] = to_float(head_buf[i][hs:hs + WIN])
 
-    # ---- transforms per clip: cumulative (tight/balanced) or per-seam LOCAL (ramped) ----
+    # ---- per-seam RAW components + metric gate (shared by all modes) ----
+    # Estimate each seam's full correction (geometry/colour/sharpness/lighting) mapping clip i's
+    # head to clip i-1's ORIGINAL tail, then a metric gate picks a strength alpha[i] in [0,1]:
+    # the correction is kept only insofar as it actually reduces the seam (SSIM/dE/L1) vs raw.
+    # This contains bad fits (duplicate-frame noise, already-sub-baseline seams, real content
+    # jumps) instead of blindly applying and cascading them.
     local = (mode == "local")
     I2 = np.array([[1, 0, 0], [0, 1, 0]], dtype=np.float32)
-    if not local:
-        # geometry: cumulative full affine to clip-0 space + a border-removing crop-zoom
+    Mraw, graw, braw, shraw, Lraw, alpha = [I2.copy()], [np.ones(3)], [np.zeros(3)], [1.0], [torch.ones(3, *GRID)], [0.0]
+    for i in range(1, N):
+        M_i = seam_affine(last_f[i - 1], align_f[i])[:2].astype(np.float32)
+        g_i, b_i, sh_i = color_sharp_fit(tails[i - 1], heads[i])
+        L_i = lighting_gain(last_f[i - 1], apply_frame(align_f[i], M_i, g_i, b_i, sh_i, Ww, Hh)).clamp(0.80, 1.25)
+        seam_frame = heads[i][0]                                  # the next-clip frame that lands at the seam
+
+        def build(a, M_i=M_i, g_i=g_i, b_i=b_i, sh_i=sh_i, L_i=L_i, sf=seam_frame):
+            Mw, gw, bw, sw, Lw = scale_strength(M_i, g_i, b_i, sh_i, L_i, a)
+            return apply_frame(sf, Mw, gw, bw, sw, Ww, Hh, Lw)
+
+        Mraw.append(M_i); graw.append(g_i); braw.append(b_i); shraw.append(sh_i); Lraw.append(L_i)
+        alpha.append(gate_strength(last_f[i - 1], build))
+
+    # ---- crop-cap guard: reject a seam whose geometry would need an excessive border crop ----
+    # A mis-correspondence (e.g. a real content jump at the cut) can yield an affine with a small
+    # axis scale but a large translation/shear that the L1 gate rewards (it slides the frames into
+    # coarse overlap) yet requires cropping away a big fraction of the frame. Such a "correction"
+    # is bogus — drop it (alpha->0) so we neither zoom the whole chain nor smear its border.
+    for i in range(1, N):
+        if alpha[i] <= 0:
+            continue
+        Me = scale_strength(Mraw[i], graw[i], braw[i], shraw[i], Lraw[i], alpha[i])[0]
+        if crop_zoom_for([Me], Ww, Hh)[0, 0] > CROP_CAP:
+            alpha[i] = 0.0
+    prog("analyze", 0.30, f"Seam correction strengths: {[a for a in alpha[1:]]}")
+
+    # ---- assemble per-clip transforms from the gated components ----
+    if local:
+        # LOCAL: per-seam gated transform applied only to each clip's head with a ramp fading to
+        # identity (render) — bodies stay original (no accumulation), a bad seam is contained.
+        Ms, cum_g, cum_b, cum_s, cum_L = Mraw, graw, braw, shraw, Lraw
+        eff = [scale_strength(Mraw[i], graw[i], braw[i], shraw[i], Lraw[i], alpha[i])[0] for i in range(N)]
+        sxy = [axis_scales(np.vstack([M, [0.0, 0.0, 1.0]])) for M in eff]
+    else:
+        # TIGHT/BALANCED: compose the gated per-seam geometry cumulatively into clip-0 space.
         cum_H = [np.eye(3)]
         for i in range(1, N):
-            cum_H.append(cum_H[-1] @ seam_affine(last_f[i - 1], align_f[i]))
+            Ma = scale_strength(Mraw[i], graw[i], braw[i], shraw[i], Lraw[i], alpha[i])[0]
+            cum_H.append(cum_H[-1] @ np.vstack([Ma, [0.0, 0.0, 1.0]]))
+        Ms = [H[:2].astype(np.float32) for H in cum_H]
         sxy = [axis_scales(H) for H in cum_H]
-        zoom_x = max(1.0 / min(s[0] for s in sxy), 1.0)
-        zoom_y = max(1.0 / min(s[1] for s in sxy), 1.0)
-        cz = np.array([[zoom_x, 0, (1 - zoom_x) * Ww / 2],
-                       [0, zoom_y, (1 - zoom_y) * Hh / 2], [0, 0, 1]], dtype=np.float64)
-        Ms = [(cz @ H)[:2].astype(np.float32) for H in cum_H]
-        if mode == "tight":
+        if mode == "tight":                                      # cumulative per-seam colour (gated)
             cum_g, cum_b, cum_s = [np.ones(3)], [np.zeros(3)], [1.0]
             for i in range(1, N):
-                g, b, sh = color_sharp_fit(tails[i - 1], heads[i])
+                _, g, b, sh, _ = scale_strength(Mraw[i], graw[i], braw[i], shraw[i], Lraw[i], alpha[i])
                 cum_g.append(cum_g[-1] * g)
                 cum_b.append(cum_g[-2] * b + cum_b[-1])
-                cum_s.append(cum_s[-1] * sh)
-        else:  # balanced: map every clip to the average look
+                cum_s.append(cum_s[-1] * float(sh))
+        else:                                                    # balanced: map every clip to the average look
             tgt_m = torch.stack([s[0] for s in stats]).mean(0)
             tgt_s = torch.stack([s[1] for s in stats]).mean(0)
             tgt_h = float(np.mean([s[2] for s in stats]))
@@ -341,20 +448,11 @@ def normalize_chain(
             pf = apply_frame(last_f[i - 1], Ms[i - 1], cum_g[i - 1], cum_b[i - 1], cum_s[i - 1], Ww, Hh)
             nf = apply_frame(align_f[i], Ms[i], cum_g[i], cum_b[i], cum_s[i], Ww, Hh)
             cum_L.append((cum_L[-1] * lighting_gain(pf, nf)).clamp(0.80, 1.25))
-    else:
-        # LOCAL: per-seam transform (clip i -> clip i-1's ORIGINAL tail), NOT composed. Applied
-        # only to each clip's head with a ramp fading to identity (see render), so clip bodies
-        # stay original -> no cumulative zoom/colour buildup, resolution & colour preserved, and
-        # a bad seam fit is contained to that clip's first few frames.
-        Ms = [I2.copy()]
-        cum_g, cum_b, cum_s, cum_L = [np.ones(3)], [np.zeros(3)], [1.0], [torch.ones(3, *GRID)]
-        for i in range(1, N):
-            Ms.append(seam_affine(last_f[i - 1], align_f[i])[:2].astype(np.float32))
-            g, b, sh = color_sharp_fit(tails[i - 1], heads[i])
-            cum_g.append(g); cum_b.append(b); cum_s.append(sh)
-            nf = apply_frame(align_f[i], Ms[i], g, b, sh, Ww, Hh)
-            cum_L.append(lighting_gain(last_f[i - 1], nf).clamp(0.80, 1.25))
-        sxy = [axis_scales(np.vstack([M, [0.0, 0.0, 1.0]])) for M in Ms]
+        eff = Ms
+
+    # ---- ONE chain-consistent border-safety crop from the effective full-strength transforms ----
+    crop = crop_zoom_for(eff, Ww, Hh)
+    crop_is_id = bool(np.allclose(crop, np.eye(3)))
 
     # ---- PHASE 2: render (stream one clip at a time), drop duplicate seam frames,
     #      optionally insert interpolated in-between frames at each seam (v2) ----
@@ -366,27 +464,26 @@ def normalize_chain(
         prog("render", 0.30, f"Interpolation on ({getattr(itp, 'backend', interp_backend)}, K={interpolate})")
 
     def _apply_w(fr_u8, k, i, w):
-        """Apply clip i's transform scaled toward identity by ``w`` (1=full, 0=original)."""
+        """Apply clip i's transform scaled toward identity by ``w`` (1=full, 0=original), with the
+        uniform border-safety crop. The crop is always applied (even at w=0) so every clip shares
+        the same tiny inset -> no seam mismatch, no exposed border, correction preserved."""
         f = to_float(fr_u8[k:k + 1])[0]
         if w <= 1e-3:
-            return f.clamp(0, 1)                                 # untouched -> full original quality
-        if w >= 0.999:
-            return apply_frame(f, Ms[i], cum_g[i], cum_b[i], cum_s[i], Ww, Hh, cum_L[i])
-        Mw = (I2 + w * (Ms[i] - I2)).astype(np.float32)
-        gw = 1.0 + w * (cum_g[i] - 1.0)
-        bw = w * cum_b[i]
-        sw = 1.0 + w * (cum_s[i] - 1.0)
-        Lw = 1.0 + w * (cum_L[i] - 1.0)
-        return apply_frame(f, Mw, gw, bw, sw, Ww, Hh, Lw)
+            if crop_is_id:
+                return f.clamp(0, 1)                             # untouched -> full original quality
+            return apply_frame(f, I2, np.ones(3), np.zeros(3), 1.0, Ww, Hh, crop=crop)
+        Mw, gw, bw, sw, Lw = scale_strength(Ms[i], cum_g[i], cum_b[i], cum_s[i], cum_L[i], w)
+        return apply_frame(f, Mw, gw, bw, sw, Ww, Hh, Lw, crop=crop)
 
     def _w(i, kk):
-        """Per-frame correction weight. Cumulative modes: 1 everywhere. Local: ramp from 1 at
-        the seam to 0 over ``ramp_frames`` (clip 0 and clip bodies stay original)."""
+        """Per-frame correction weight. Cumulative modes: alpha already folded into the transforms
+        -> 1 everywhere. Local: gate strength alpha[i] at the seam, ramped to 0 over
+        ``ramp_frames`` (clip 0 and clip bodies stay original)."""
         if not local:
             return 1.0
         if i == 0:
             return 0.0
-        return max(0.0, 1.0 - kk / max(ramp_frames, 1))
+        return alpha[i] * max(0.0, 1.0 - kk / max(ramp_frames, 1))
 
     def gen():
         prev_corr_last = None
@@ -448,6 +545,7 @@ def normalize_chain(
         interpolate=interpolate,
         interp_backend=(getattr(itp, "backend", interp_backend) if itp is not None else ""),
         transforms={
+            "strength": [round(float(a), 3) for a in alpha],
             "scale_xy_pct": [[round((x - 1) * 100, 2), round((y - 1) * 100, 2)] for x, y in sxy],
             "colour_gain": [round(float(np.mean(g)), 3) for g in cum_g],
             "sharpness": [round(float(s), 3) for s in cum_s],
@@ -460,9 +558,26 @@ def _win_expr(seams: list[int], r: int) -> str:
     return "+".join(f"between(n\\,{max(0, s - r)}\\,{s + r})" for s in seams)
 
 
+def _seam_eq(seams: list[int], r: int = 2) -> str:
+    """ffmpeg enable expr true within +/-r frames of a seam (boundary), so the green marker holds
+    a beat around the cut instead of flashing by in a single (slowed) frame."""
+    return "+".join(f"between(n\\,{max(0, s - r)}\\,{s + r})" for s in seams) or "0"
+
+
+def _dot_png(path: str, bgr: tuple, r: int = 30) -> None:
+    """Write a filled circular RGBA marker (transparent outside) for the boundary indicator."""
+    s = 2 * r + 8
+    img = np.zeros((s, s, 4), np.uint8)
+    cv2.circle(img, (s // 2, s // 2), r, (bgr[0], bgr[1], bgr[2], 255), -1, lineType=cv2.LINE_AA)
+    cv2.circle(img, (s // 2, s // 2), r, (30, 30, 30, 255), 3, lineType=cv2.LINE_AA)   # dark ring
+    cv2.imwrite(path, img)
+
+
 def _build_slow(clip_paths, full_path, out_dir, raw_seam, fix_seam, fps) -> str | None:
     """RAW (straight concat) | FIXED (normalized) side-by-side, boundary regions, slowed.
-    Each side is windowed around ITS OWN seam positions so the same moment lines up."""
+    Each side is windowed around ITS OWN seam positions so the same moment lines up. A round
+    indicator sits at each side's top-right: grey normally, turning GREEN exactly on the boundary
+    (cut) frame so the eye knows precisely where the seam is."""
     raw_concat = os.path.join(out_dir, "raw_concat.mp4")
     inputs = []
     for p in clip_paths:
@@ -478,24 +593,39 @@ def _build_slow(clip_paths, full_path, out_dir, raw_seam, fix_seam, fps) -> str 
         return None
 
     slow_path = os.path.join(out_dir, "result_boundaries_slow.mp4")
+    grey_png = os.path.join(out_dir, "_dot_grey.png")
+    green_png = os.path.join(out_dir, "_dot_green.png")
+    _dot_png(grey_png, (150, 150, 150), r=26)     # BGR
+    _dot_png(green_png, (60, 210, 60), r=26)
     raw_sel = f"select='{_win_expr(raw_seam, SLOW_RADIUS)}',setpts=N/{SLOW_FACTOR}/TB"
     fix_sel = f"select='{_win_expr(fix_seam, SLOW_RADIUS)}',setpts=N/{SLOW_FACTOR}/TB"
+    # sit the marker right beside the RAW/FIXED label (top-left), vertically centred on the text
+    pos_raw = "x=150:y=17"                         # just past "RAW"
+    pos_fix = "x=214:y=17"                         # just past "FIXED"
+    raw_eq, fix_eq = _seam_eq(raw_seam), _seam_eq(fix_seam)
+    # overlay grey (always) then green (a beat around the boundary) BEFORE select, so the green
+    # keys on the ORIGINAL frame index; then window + slow; optional RAW/FIXED text label.
     dt = "drawtext=text='{t}':x=24:y=24:fontsize=54:fontcolor=yellow:box=1:boxcolor=black@0.5"
-    fc = (f"[0:v]{raw_sel},{dt.format(t='RAW')}[l];"
-          f"[1:v]{fix_sel},{dt.format(t='FIXED')}[r];[l][r]hstack=inputs=2[o]")
-    try:
-        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", raw_concat, "-i", full_path,
-                        "-filter_complex", fc, "-map", "[o]", "-r", str(int(round(fps))),
-                        "-c:v", "libx264", "-crf", "18", "-pix_fmt", "yuv420p", slow_path],
-                       check=True)
+
+    def _fc(lbl_raw: str, lbl_fix: str) -> str:
+        return (
+            "[2:v]split=2[gd0][gd1];[3:v]split=2[gn0][gn1];"
+            f"[0:v][gd0]overlay={pos_raw}[l0];[l0][gn0]overlay={pos_raw}:enable='{raw_eq}'[l1];"
+            f"[l1]{raw_sel}{lbl_raw}[l];"
+            f"[1:v][gd1]overlay={pos_fix}[r0];[r0][gn1]overlay={pos_fix}:enable='{fix_eq}'[r1];"
+            f"[r1]{fix_sel}{lbl_fix}[r];[l][r]hstack=inputs=2[o]"
+        )
+
+    common = ["-i", raw_concat, "-i", full_path, "-i", grey_png, "-i", green_png]
+    enc = ["-map", "[o]", "-r", str(int(round(fps))), "-c:v", "libx264", "-crf", "18",
+           "-pix_fmt", "yuv420p", slow_path]
+    try:                                           # with RAW/FIXED labels (needs a usable font)
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", *common, "-filter_complex",
+                        _fc(f",{dt.format(t='RAW')}", f",{dt.format(t='FIXED')}"), *enc], check=True)
     except subprocess.CalledProcessError:
-        # drawtext (fontconfig) can be unavailable; retry without labels
-        fc2 = (f"[0:v]{raw_sel}[l];[1:v]{fix_sel}[r];[l][r]hstack=inputs=2[o]")
-        try:
-            subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", raw_concat, "-i", full_path,
-                            "-filter_complex", fc2, "-map", "[o]", "-r", str(int(round(fps))),
-                            "-c:v", "libx264", "-crf", "18", "-pix_fmt", "yuv420p", slow_path],
-                           check=True)
+        try:                                       # drawtext/fontconfig unavailable: dots only
+            subprocess.run(["ffmpeg", "-y", "-loglevel", "error", *common, "-filter_complex",
+                            _fc("", ""), *enc], check=True)
         except subprocess.CalledProcessError:
             return None
     return slow_path

@@ -32,6 +32,10 @@ so both sides of each cut match and no downstream cut breaks (a local fix would 
 tail = the next clip's anchor). Per clip:
 - **geometry** — full affine (independent x/y scale; anisotropic, so not a similarity transform), matched on the **static background only**
 - **colour/exposure** (per-channel mean+std) · **sharpness** (high-freq) · **lighting** (spatially-varying low-freq gain, subject-masked)
+- **metric gate (do-no-harm)** — each seam's correction strength α∈[0,1] is **chosen automatically by SSIM·ΔE·L1**:
+  applied only insofar as it actually shrinks the seam, so a correction that doesn't help (duplicate-frame noise,
+  an already-sub-baseline seam, a real content jump) self-rejects to α→0. A mis-correspondence affine that would
+  need an excessive crop is rejected too → never zooms the whole frame or dulls the colour
 - **drop the duplicate frame** → freeze becomes normal motion. If the generator repeated **K
   frames** at each boundary, use **`--overlap K`** (drops K, aligns on the `prev[-1]↔next[K-1]`
   duplicate pair — actually more accurate). Default 1; 0 drops nothing; **`--overlap auto`
